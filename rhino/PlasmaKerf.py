@@ -7,8 +7,9 @@ torch centerline. Enter bakes the result onto layers.
 
 Rhino 7 / 8
 -----------
-Closed openings are sampled once to a polyline (capped) and widened in
-plain 2D math. Rhino is not asked to CurveCurve / GetLength / Contains
+Closed openings are sampled once to a polyline (capped) for width, then
+the original curve is offset along its own normals and rebuilt as a
+degree-3 NURBS. Rhino is not asked to CurveCurve / GetLength / Contains
 on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
@@ -315,7 +316,20 @@ def _prepare_ring(points):
     return (ring, samples, spacing)
 
 
-def _apply_min_width(ring, samples, spacing, min_width):
+def _nearest_edge(origin, ring):
+    n = len(ring)
+    best_i = 0
+    best = 1e300
+    for i in range(n):
+        close = _closest_on_seg(origin, ring[i], ring[(i + 1) % n])
+        d = _vdist(origin, close)
+        if d < best:
+            best = d
+            best_i = i
+    return best_i
+
+
+def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
     if len(ring) < 3 or min_width <= 0:
         return (ring, 0)
     if len(samples) < 3:
@@ -343,7 +357,7 @@ def _apply_min_width(ring, samples, spacing, min_width):
         turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
         delta = deltas[i]
         p_off = _offset_point(curr, delta, ring)
-        if abs(turn) > 0.35 and delta > 0.05 and moved:
+        if round_corners and abs(turn) > 0.35 and delta > 0.05 and moved:
             from_pt = _offset_point({"point": curr["point"], "inward": prev["inward"]}, delta, ring)
             to_pt = _offset_point(curr, delta, ring)
             if _vdist(from_pt, to_pt) > 0.08:
@@ -582,6 +596,72 @@ def _polyline_curve(plane, ring):
         return None
 
 
+def _samples_from_curve(curve, plane, ring, count):
+    """Walk the original curve so the offset keeps its fair normals."""
+    samples = []
+    ts = None
+    try:
+        ts = curve.DivideByCount(max(8, int(count)), True)
+    except Exception:
+        ts = None
+    if not ts:
+        domain = curve.Domain
+        steps = max(8, int(count))
+        ts = [domain.Min + (domain.Max - domain.Min) * (i / float(steps)) for i in range(steps)]
+    for t in ts:
+        pt = curve.PointAt(t)
+        xy = _to_xy(plane, pt)
+        tan = curve.TangentAt(t)
+        tan2 = _vunit((tan * plane.XAxis, tan * plane.YAxis))
+        inward = _vleft(tan2)
+        probe = _vadd(xy, _vmul(inward, 0.2))
+        if not _point_in_ring(probe, ring):
+            inward = _vmul(inward, -1.0)
+        edge = _nearest_edge(xy, ring)
+        width = _local_width(xy, inward, ring, edge)
+        samples.append({
+            "point": xy,
+            "inward": inward,
+            "edge": edge,
+            "width": width,
+            "t": t,
+        })
+    return samples
+
+
+def _interpolated_closed(plane, ring):
+    """Degree-3 periodic NURBS through the offset points — not a polyline."""
+    if len(ring) < 4:
+        return _polyline_curve(plane, ring)
+    pts = [_from_xy(plane, p) for p in ring]
+    styles = []
+    try:
+        styles.append(rg.CurveKnotStyle.ChordPeriodic)
+        styles.append(rg.CurveKnotStyle.UniformPeriodic)
+    except Exception:
+        pass
+    for style in styles:
+        try:
+            crv = rg.Curve.CreateInterpolatedCurve(pts, 3, style)
+            if crv is not None and crv.IsValid:
+                if not crv.IsClosed:
+                    try:
+                        crv.MakeClosed(_tol() * 4)
+                    except Exception:
+                        pass
+                return crv
+        except Exception:
+            pass
+    try:
+        closed_pts = list(pts) + [pts[0]]
+        crv = rg.Curve.CreateInterpolatedCurve(closed_pts, 3)
+        if crv is not None and crv.IsValid:
+            return crv
+    except Exception:
+        pass
+    return _polyline_curve(plane, ring)
+
+
 _CLOSED_PREP = {}
 
 
@@ -604,12 +684,17 @@ def _ensure_min_width(curve, min_width, corners):
     if prep is None:
         count = min(MAX_SAMPLES, max(48, int(math.ceil(length / 0.35))))
         ring = _curve_ring_xy(curve, plane, count)
-        ring, samples, spacing = _prepare_ring(ring)
+        ring = _cap_ring(_ensure_ccw(_clean_ring(ring, max(_tol(), 0.02))), MAX_SAMPLES)
+        out_count = min(320, max(96, int(math.ceil(length / 1.0))))
+        samples = _samples_from_curve(curve, plane, ring, out_count)
+        spacing = length / float(max(len(samples), 1))
         prep = (plane, ring, samples, spacing)
         _CLOSED_PREP[key] = prep
     plane, ring, samples, spacing = prep
-    moved, pinches = _apply_min_width(ring, samples, spacing, min_width)
-    outline_curve = _polyline_curve(plane, moved)
+    moved, pinches = _apply_min_width(ring, samples, spacing, min_width, round_corners=False)
+    if pinches == 0:
+        return [curve.DuplicateCurve()], 0, []
+    outline_curve = _interpolated_closed(plane, moved)
     if outline_curve is None:
         return [curve.DuplicateCurve()], pinches, []
     if not outline_curve.IsClosed:
