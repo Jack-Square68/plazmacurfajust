@@ -9,8 +9,8 @@ Rhino 7 / 8
 -----------
 Closed openings are sampled once to a polyline (capped) for width, then
 the original curve is offset along its own normals and rebuilt as a
-degree-3 NURBS. Hairpin tips tighter than the offset become a round cap
-instead of a self-intersecting loop. Rhino is not asked to CurveCurve /
+degree-3 NURBS. Sharp corners get a simple wall-to-wall radius — they are not
+wrapped into a bulge around the original vertex. Rhino is not asked to CurveCurve /
 GetLength / Contains on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
@@ -305,16 +305,6 @@ def _offset_point(sample, delta, ring):
     return _vadd(sample["point"], _vmul(outward, delta))
 
 
-def _point_radius(prev, curr, nxt):
-    t1 = _vunit(_vsub(curr, prev))
-    t2 = _vunit(_vsub(nxt, curr))
-    turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
-    ds = 0.5 * (_vdist(prev, curr) + _vdist(curr, nxt))
-    if abs(turn) < 1e-4:
-        return 1e9, turn
-    return abs(ds / turn), turn
-
-
 def _seg_intersect(a, b, c, d):
     """Return intersection point of proper overlap, else None."""
     ab = _vsub(b, a)
@@ -384,63 +374,64 @@ def _remove_loops(pts):
     return pts
 
 
-def _offset_with_tip_caps(samples, deltas, ring):
-    """Offset along normals, but replace hairpins that would loop with a round cap."""
-    n = len(samples)
-    offs = [_offset_point(samples[i], deltas[i], ring) for i in range(n)]
-    tight = []
-    for i in range(n):
-        radius, turn = _point_radius(
-            samples[(i - 1 + n) % n]["point"],
-            samples[i]["point"],
-            samples[(i + 1) % n]["point"],
-        )
-        cusp = deltas[i] > 0.05 and (radius < deltas[i] * 1.45 or abs(turn) > 2.15)
-        tight.append(cusp)
-    if any(tight):
-        dilated = list(tight)
-        for i in range(n):
-            if tight[i]:
-                for j in ((i - 1 + n) % n, (i + 1) % n):
-                    if deltas[j] > 0.04:
-                        dilated[j] = True
-        tight = dilated
-    if not any(tight) or all(tight):
-        return offs
+def _arc_points(center, start, end, radius, ring):
+    pts = _exterior_arc(center, start, end, radius, ring)
+    return pts
 
-    start = 0
-    for i in range(n):
-        if not tight[i]:
-            start = i
-            break
 
+def _simple_corner(a, b, c, radius, ring):
+    """Fillet walls at b with a compact radius. Does not wrap a bulge around the original vertex."""
+    if radius < 0.04:
+        return [b]
+    t1 = _vunit(_vsub(b, a))
+    t2 = _vunit(_vsub(c, b))
+    turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
+    if abs(turn) < 0.18:
+        return [b]
+    d1 = _vdist(a, b)
+    d2 = _vdist(b, c)
+    if d1 < 0.05 or d2 < 0.05:
+        return [b]
+
+    # Hairpin: cap with a semicircle that fits between the two walls — no extra bulb.
+    if abs(turn) > 2.05:
+        p0 = (b[0] - t1[0] * min(radius, d1 * 0.35), b[1] - t1[1] * min(radius, d1 * 0.35))
+        p1 = (b[0] + t2[0] * min(radius, d2 * 0.35), b[1] + t2[1] * min(radius, d2 * 0.35))
+        mid = ((p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5)
+        fit_r = max(_vdist(p0, p1) * 0.5, 0.08)
+        return [p0] + _arc_points(mid, p0, p1, fit_r, ring) + [p1]
+
+    half = abs(turn) * 0.5
+    tan_h = math.tan(half)
+    if tan_h < 1e-6:
+        return [b]
+    # Limit trim so an acute corner cannot balloon past a simple radius.
+    trim = min(radius * tan_h, radius * 1.1, d1 * 0.42, d2 * 0.42)
+    if trim < 0.04:
+        return [b]
+    r_used = trim / tan_h
+    p0 = (b[0] - t1[0] * trim, b[1] - t1[1] * trim)
+    p1 = (b[0] + t2[0] * trim, b[1] + t2[1] * trim)
+    left = (-t1[1], t1[0])
+    outward = (-left[0], -left[1]) if turn > 0 else left
+    center = (p0[0] + outward[0] * r_used, p0[1] + outward[1] * r_used)
+    if _point_in_ring(center, ring):
+        outward = (-outward[0], -outward[1])
+        center = (p0[0] + outward[0] * r_used, p0[1] + outward[1] * r_used)
+    return [p0] + _arc_points(center, p0, p1, r_used, ring) + [p1]
+
+
+def _fillet_offset_ring(points, radii, ring):
+    n = len(points)
+    if n < 3:
+        return points
     out = []
-    i = 0
-    while i < n:
-        idx = (start + i) % n
-        if not tight[idx]:
-            out.append(offs[idx])
-            i += 1
-            continue
-        run = 0
-        while i + run < n and tight[(start + i + run) % n]:
-            run += 1
-        from_pt = out[-1] if out else offs[(start + i - 1) % n]
-        after = (start + i + run) % n
-        to_pt = offs[after]
-        best_k = (start + i) % n
-        best_d = deltas[best_k]
-        for k in range(run):
-            kk = (start + i + k) % n
-            if deltas[kk] >= best_d:
-                best_d = deltas[kk]
-                best_k = kk
-        center = samples[best_k]["point"]
-        radius = max(best_d, 0.15)
-        if _vdist(from_pt, to_pt) > 0.06:
-            out.extend(_exterior_arc(center, from_pt, to_pt, radius, ring))
-        i += run
-    return out if len(out) >= 3 else offs
+    for i in range(n):
+        a = points[(i - 1 + n) % n]
+        b = points[i]
+        c = points[(i + 1) % n]
+        out.extend(_simple_corner(a, b, c, radii[i], ring))
+    return _clean_ring(out, 0.02)
 
 
 def _prepare_ring(points):
@@ -485,29 +476,20 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
     sigma = max(1.2, (min_width * 0.55) / spacing)
     deltas = _smooth_closed_values(raw, sigma)
     pinches = _thin_runs([d > 0.04 for d in deltas])
-    if not round_corners:
-        moved = _offset_with_tip_caps(samples, deltas, ring)
-    else:
-        moved = []
-        n = len(samples)
-        for i in range(n):
-            prev = samples[(i - 1 + n) % n]
-            curr = samples[i]
-            nxt = samples[(i + 1) % n]
-            t1 = _vunit(_vsub(curr["point"], prev["point"]))
-            t2 = _vunit(_vsub(nxt["point"], curr["point"]))
-            turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
-            delta = deltas[i]
-            p_off = _offset_point(curr, delta, ring)
-            if abs(turn) > 0.35 and delta > 0.05 and moved:
-                from_pt = _offset_point({"point": curr["point"], "inward": prev["inward"]}, delta, ring)
-                to_pt = _offset_point(curr, delta, ring)
-                if _vdist(from_pt, to_pt) > 0.08:
-                    moved.append(from_pt)
-                    moved.extend(_exterior_arc(curr["point"], from_pt, to_pt, delta, ring))
-            moved.append(p_off)
-        moved = _offset_with_tip_caps(samples, deltas, ring) if _polyline_self_intersects(moved) else moved
+    moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
     cleaned = _remove_loops(_clean_ring(moved, 0.02))
+    n = len(cleaned)
+    if n >= 3:
+        radii = []
+        for i in range(n):
+            # Match each corner to nearby sample delta; never use a fat vertex-centered cap.
+            nearest = min(
+                range(len(samples)),
+                key=lambda k: _vdist(cleaned[i], samples[k]["point"]),
+            )
+            radii.append(max(deltas[nearest], 0.0))
+        cleaned = _fillet_offset_ring(cleaned, radii, ring)
+        cleaned = _remove_loops(cleaned)
     return (cleaned if len(cleaned) >= 3 else ring, pinches)
 
 
@@ -1189,6 +1171,16 @@ def _self_test():
     assert_true(pinches > 0, "hairpin tip should be under min width")
     assert_true(not _polyline_self_intersects(moved), "hairpin tip must not loop")
     assert_true(max(ys) > 42.0, "hairpin tip should grow to a round cap, maxY={0}".format(max(ys)))
+
+    # 90° corner of a 3 mm band grown to 6 mm: simple radius, not a bulb.
+    elbow = [
+        (0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (37.0, 40.0),
+        (37.0, 3.0), (0.0, 3.0),
+    ]
+    moved, pinches = ensure_min_width_ring(elbow, 6.0)
+    xs = [p[0] for p in moved]
+    assert_true(pinches > 0, "thin elbow should widen")
+    assert_true(max(xs) < 44.5, "elbow corner should be a simple radius, not a bulge (maxX={0})".format(max(xs)))
 
     print("PlasmaKerf math tests passed")
 
