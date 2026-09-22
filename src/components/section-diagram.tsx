@@ -150,5 +150,5 @@ function caption(mode: CutMode, single: boolean): string {
   if (mode === "part") return "Finished part (red) · torch outside (orange)";
   if (mode === "hole") return "Finished hole (black) · torch inside (orange)";
   if (single) return "Single pass — slot will be kerf-wide";
-  return "Red path · black finished slot · orange torch";
+  return "Black outline stays put except where width is under min";
 }

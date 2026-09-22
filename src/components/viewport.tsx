@@ -314,7 +314,9 @@ function drawScene(ctx: CanvasRenderingContext2D, s: Scene) {
     drawCurveLabel(ctx, s.camera, curve, selected);
     if (selected) {
       drawVertices(ctx, s.camera, curve.points);
-      if (s.params.mode === "slot") drawWidthDim(ctx, s.camera, curve, s.params.minWidth);
+      if (s.params.mode === "slot" && !curve.closed) {
+        drawWidthDim(ctx, s.camera, curve, s.params.minWidth);
+      }
     }
   }
 

@@ -26,6 +26,26 @@ export function unit(a: Point): Point {
   return { x: a.x / L, y: a.y / L };
 }
 
+export function cross(a: Point, b: Point): number {
+  return a.x * b.y - a.y * b.x;
+}
+
+export function rotateLeft(tangent: Point): Point {
+  return { x: -tangent.y, y: tangent.x };
+}
+
+/** Distance along a ray `origin + t * dir` to segment ab, or null if no hit. */
+export function raySegmentT(origin: Point, dir: Point, a: Point, b: Point): number | null {
+  const seg = sub(b, a);
+  const det = cross(dir, seg);
+  if (Math.abs(det) < 1e-12) return null;
+  const ao = sub(a, origin);
+  const t = cross(ao, seg) / det;
+  const u = cross(ao, dir) / det;
+  if (t > 1e-4 && u >= -1e-6 && u <= 1 + 1e-6) return t;
+  return null;
+}
+
 export function cleanPoints(points: Point[], closed: boolean, eps = 0.001): Point[] {
   if (points.length === 0) return [];
   const out: Point[] = [points[0]];
@@ -250,3 +270,28 @@ export function formatMm(n: number): string {
   const rounded = Math.round(n * 100) / 100;
   return Number.isInteger(rounded) ? `${rounded}` : rounded.toFixed(2);
 }
+
+/** Moving-average a closed or open polyline so offsets follow a fair curve. */
+export function smoothPolyline(points: Point[], closed: boolean, passes = 2): Point[] {
+  if (points.length < 3) return points;
+  let curr = points;
+  for (let pass = 0; pass < passes; pass++) {
+    const next: Point[] = [];
+    for (let i = 0; i < curr.length; i++) {
+      if (!closed && (i === 0 || i === curr.length - 1)) {
+        next.push(curr[i]);
+        continue;
+      }
+      const prev = curr[(i - 1 + curr.length) % curr.length];
+      const mid = curr[i];
+      const nxt = curr[(i + 1) % curr.length];
+      next.push({
+        x: (prev.x + mid.x * 2 + nxt.x) / 4,
+        y: (prev.y + mid.y * 2 + nxt.y) / 4,
+      });
+    }
+    curr = next;
+  }
+  return curr;
+}
+

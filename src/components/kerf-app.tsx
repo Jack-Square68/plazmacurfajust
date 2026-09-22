@@ -218,8 +218,8 @@ export function KerfApp() {
             <h1 className="font-heading text-xl leading-tight tracking-tight">Kerf</h1>
           </div>
           <p className="hidden max-w-xl text-sm text-muted-foreground sm:block">
-            Turn a thin red centerline into a black plasma cut with an adjustable minimum
-            width, then account for torch kerf.
+            Widen only the parts of an opening that fall under the minimum width, then
+            account for torch kerf. Open centerlines still thicken the whole path.
           </p>
         </header>
 
@@ -279,6 +279,8 @@ export function KerfApp() {
             onSelect={(id) => selectCurve(id)}
             error={compensated?.error}
             singlePass={Boolean(compensated?.singlePass)}
+            pinches={compensated?.pinches}
+            selectedClosed={Boolean(selected?.closed)}
           />
         </div>
       </div>

@@ -1,6 +1,6 @@
 # Kerf — plasma curve compensation for Rhino
 
-Click a curve. Get a black cut outline with an adjustable **minimum width**, then inset it by **plasma kerf** so the finished opening matches what you meant.
+Click a curve. Get a black cut outline that only grows where the opening is under the **minimum width**, then inset it by **plasma kerf** so the finished opening matches what you meant.
 
 This repo is two pieces of the same tool:
 
@@ -13,8 +13,8 @@ Plasma burns a slot about as wide as the torch kerf. A skinny red centerline on 
 
 | You draw (red) | Tool builds (black) |
 | --- | --- |
-| Open centerline | Stadium / capsule of **Min width**, round or square caps |
-| Closed centerline | Inner + outer offset of **Min width** |
+| Open centerline | Stadium / capsule of **Min width**, round or square caps (the whole path is under min width) |
+| Closed opening | Only stretches **narrower than Min width** are widened. Already-wide curves stay as drawn; thin tapers get a **smooth** min-width capsule with round ends |
 | Part profile | Torch path **outside** by kerf / 2 |
 | Hole profile | Torch path **inside** by kerf / 2 |
 

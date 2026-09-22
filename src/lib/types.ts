@@ -27,6 +27,8 @@ export type Compensated = {
   toolpath: Point[][];
   singlePass: boolean;
   error?: string;
+  /** Narrow stretches that were widened to min width. 0 = already wide enough. */
+  pinches?: number;
 };
 
 export const DEFAULT_PARAMS: KerfParams = {

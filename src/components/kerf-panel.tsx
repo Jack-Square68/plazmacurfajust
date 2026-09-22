@@ -18,6 +18,8 @@ type Props = {
   onSelect: (id: string) => void;
   error?: string;
   singlePass: boolean;
+  pinches?: number;
+  selectedClosed?: boolean;
 };
 
 export function KerfPanel({
@@ -28,6 +30,8 @@ export function KerfPanel({
   onSelect,
   error,
   singlePass,
+  pinches,
+  selectedClosed,
 }: Props) {
   const slot = params.mode === "slot";
 
@@ -39,8 +43,8 @@ export function KerfPanel({
         </p>
         <h2 className="mt-1 font-heading text-lg">Plasma kerf</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Click a red curve, then tune minimum width and kerf. The black outline is the
-          finished cut.
+          Click a red curve, then tune minimum width and kerf. Closed openings only
+          widen where they are under the minimum; the black outline is the finished cut.
         </p>
       </div>
 
@@ -69,7 +73,7 @@ export function KerfPanel({
         </ToggleGroup>
         <p className="text-xs text-muted-foreground">
           {params.mode === "slot" &&
-            "Thicken a centerline so the opening is at least the minimum width."}
+            "Open centerline: thicken the whole path. Closed opening: only thin tapers grow — wide curves stay, tips round off smoothly."}
           {params.mode === "part" &&
             "Keep the red profile as the finished part. Torch path sits outside by kerf/2."}
           {params.mode === "hole" &&
@@ -100,6 +104,20 @@ export function KerfPanel({
       />
 
       <SectionDiagram params={params} />
+
+      {slot && selectedClosed && pinches === 0 && (
+        <p className="rounded-lg bg-zinc-100 px-3 py-2 text-xs text-zinc-800 ring-1 ring-zinc-200">
+          This opening is already at least {formatMm(params.minWidth)} mm. Wide areas
+          stay as drawn; only kerf is applied.
+        </p>
+      )}
+
+      {slot && selectedClosed && (pinches ?? 0) > 0 && (
+        <p className="rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-950 ring-1 ring-emerald-200">
+          Widened {pinches} narrow stretch{pinches === 1 ? "" : "es"} to{" "}
+          {formatMm(params.minWidth)} mm. The rest of the opening is unchanged.
+        </p>
+      )}
 
       {singlePass && slot && (
         <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-950 ring-1 ring-amber-200">

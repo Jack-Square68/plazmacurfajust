@@ -6,7 +6,8 @@
     "dev": "next dev --port 43147 --hostname 127.0.0.1",
     "build": "next build",
     "start": "next start --port 43147 --hostname 127.0.0.1",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "npx --yes tsx src/lib/offset.test.ts"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",
