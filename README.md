@@ -45,6 +45,10 @@ Nearly-closed paths auto-close. Open strokes from a file are left as drawn — t
    - Command: `-_RunPythonScript "C:\full\path\to\PlasmaKerf.py"`
 3. Or drag the `.py` file onto the Rhino viewport.
 
+Copy this file again after updates — Rhino keeps using the path you last ran.
+
+Closed openings are sampled once to a polyline (at most a few hundred points) and widened in plain math. That is what stopped the old script from locking Rhino on a koru: it used to fire `GetLength` / `Contains` on the NURBS for every sample.
+
 Rhino 8 also works from **ScriptEditor**: open the file and Run.
 
 ### Command

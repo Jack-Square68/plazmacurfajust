@@ -7,6 +7,10 @@ torch centerline. Enter bakes the result onto layers.
 
 Rhino 7 / 8
 -----------
+Closed openings are sampled once to a polyline (capped) and widened in
+plain 2D math. Rhino is not asked to CurveCurve / GetLength / Contains
+on every sample, so a koru no longer locks the UI.
+
 Drag this file onto the Rhino window, or:
 
     _-RunPythonScript "<path>/PlasmaKerf.py"
@@ -29,14 +33,334 @@ from __future__ import print_function
 
 import math
 
-import Rhino
-import Rhino.DocObjects as rd
-import Rhino.Geometry as rg
-import Rhino.Input.Custom as ric
-import scriptcontext as sc
-import System
-import System.Drawing
-from System.Drawing import Color
+try:
+    import Rhino
+    import Rhino.DocObjects as rd
+    import Rhino.Geometry as rg
+    import Rhino.Input.Custom as ric
+    import scriptcontext as sc
+    import System
+    import System.Drawing
+    from System.Drawing import Color
+    HAS_RHINO = True
+except ImportError:
+    HAS_RHINO = False
+    Rhino = rd = rg = ric = sc = System = None
+    Color = None
+
+
+# Fast 2D min-width math. Rhino used to probe every sample with CurveCurve +
+# GetLength/Contains on the NURBS (O(samples * inner_steps)); that froze the UI
+# on a typical koru. This is the same polyline walk as the web tool.
+
+MAX_SAMPLES = 360
+
+
+def _vsub(a, b):
+    return (a[0] - b[0], a[1] - b[1])
+
+
+def _vadd(a, b):
+    return (a[0] + b[0], a[1] + b[1])
+
+
+def _vmul(a, s):
+    return (a[0] * s, a[1] * s)
+
+
+def _vdist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _vunit(a):
+    length = math.hypot(a[0], a[1])
+    if length < 1e-12:
+        return (0.0, 0.0)
+    return (a[0] / length, a[1] / length)
+
+
+def _vcross(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _vleft(tangent):
+    return (-tangent[1], tangent[0])
+
+
+def _clean_ring(points, eps=0.02):
+    if not points:
+        return []
+    out = [points[0]]
+    for p in points[1:]:
+        if _vdist(p, out[-1]) > eps:
+            out.append(p)
+    if len(out) > 2 and _vdist(out[0], out[-1]) <= eps:
+        out.pop()
+    return out
+
+
+def _signed_area_xy(points):
+    area = 0.0
+    n = len(points)
+    for i in range(n):
+        a = points[i]
+        b = points[(i + 1) % n]
+        area += a[0] * b[1] - b[0] * a[1]
+    return area * 0.5
+
+
+def _ensure_ccw(points):
+    if _signed_area_xy(points) < 0:
+        return list(reversed(points))
+    return list(points)
+
+
+def _point_in_ring(p, ring):
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        a = ring[i]
+        b = ring[j]
+        if (a[1] > p[1]) != (b[1] > p[1]):
+            x = ((b[0] - a[0]) * (p[1] - a[1]) / ((b[1] - a[1]) or 1e-18)) + a[0]
+            if p[0] < x:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _closest_on_seg(p, a, b):
+    ab = _vsub(b, a)
+    ap = _vsub(p, a)
+    den = ab[0] * ab[0] + ab[1] * ab[1]
+    if den < 1e-18:
+        return a
+    t = (ap[0] * ab[0] + ap[1] * ab[1]) / den
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    return (a[0] + ab[0] * t, a[1] + ab[1] * t)
+
+
+def _ray_seg_t(origin, direction, a, b):
+    seg = _vsub(b, a)
+    det = _vcross(direction, seg)
+    if abs(det) < 1e-12:
+        return None
+    ao = _vsub(a, origin)
+    t = _vcross(ao, seg) / det
+    u = _vcross(ao, direction) / det
+    if t > 1e-4 and -1e-6 <= u <= 1.0 + 1e-6:
+        return t
+    return None
+
+
+def _ring_length(ring):
+    total = 0.0
+    n = len(ring)
+    for i in range(n):
+        total += _vdist(ring[i], ring[(i + 1) % n])
+    return total
+
+
+def _cap_ring(ring, max_count):
+    if len(ring) <= max_count:
+        return ring
+    total = _ring_length(ring)
+    if total < 1e-9:
+        return ring[:max_count]
+    spacing = total / float(max_count)
+    out = [ring[0]]
+    acc = 0.0
+    n = len(ring)
+    for i in range(n):
+        a = ring[i]
+        b = ring[(i + 1) % n]
+        seg = _vdist(a, b)
+        if seg < 1e-12:
+            continue
+        acc += seg
+        while acc >= spacing and len(out) < max_count:
+            t = 1.0 - (acc - spacing) / seg
+            if t < 0.0:
+                t = 0.0
+            if t > 1.0:
+                t = 1.0
+            pt = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+            if _vdist(pt, out[-1]) > 1e-6:
+                out.append(pt)
+            acc -= spacing
+    return out if len(out) >= 3 else ring[:max_count]
+
+
+def _sample_boundary(ring, spacing):
+    samples = []
+    n = len(ring)
+    for i in range(n):
+        a = ring[i]
+        b = ring[(i + 1) % n]
+        length = _vdist(a, b)
+        if length < 1e-9:
+            continue
+        tangent = _vunit(_vsub(b, a))
+        inward = _vleft(tangent)
+        steps = max(1, int(math.ceil(length / spacing)))
+        for k in range(steps):
+            t = k / float(steps)
+            samples.append({
+                "point": (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t),
+                "inward": inward,
+                "edge": i,
+            })
+    return samples
+
+
+def _local_width(origin, inward, ring, skip_edge):
+    n = len(ring)
+    best = float("inf")
+    for i in range(n):
+        wrap = min(abs(i - skip_edge), n - abs(i - skip_edge))
+        if wrap <= 1:
+            continue
+        hit = _ray_seg_t(origin, inward, ring[i], ring[(i + 1) % n])
+        if hit is not None and hit < best:
+            best = hit
+        close = _closest_on_seg(origin, ring[i], ring[(i + 1) % n])
+        gap = _vdist(origin, close)
+        if gap >= best or gap < 1e-4:
+            continue
+        mid = ((origin[0] + close[0]) * 0.5, (origin[1] + close[1]) * 0.5)
+        if _point_in_ring(mid, ring) and gap < best:
+            best = gap
+    return best
+
+
+def _smooth_closed_values(values, sigma):
+    if not values or sigma < 0.35:
+        return list(values)
+    radius = max(1, int(math.ceil(sigma * 3)))
+    kernel = []
+    total = 0.0
+    for i in range(-radius, radius + 1):
+        k = math.exp(-(i * i) / (2.0 * sigma * sigma))
+        kernel.append(k)
+        total += k
+    n = len(values)
+    out = []
+    for i in range(n):
+        acc = 0.0
+        for j in range(-radius, radius + 1):
+            acc += values[(i + j) % n] * kernel[j + radius]
+        out.append(acc / total)
+    return out
+
+
+def _thin_runs(flags):
+    if not any(flags):
+        return 0
+    runs = 0
+    in_run = False
+    for flag in flags:
+        if flag and not in_run:
+            runs += 1
+            in_run = True
+        elif not flag:
+            in_run = False
+    if flags[0] and flags[-1] and runs >= 2:
+        runs -= 1
+    return runs
+
+
+def _exterior_arc(center, start, end, radius, ring):
+    a0 = math.atan2(start[1] - center[1], start[0] - center[0])
+    a1 = math.atan2(end[1] - center[1], end[0] - center[0])
+    da = a1 - a0
+    while da <= -math.pi:
+        da += math.pi * 2.0
+    while da > math.pi:
+        da -= math.pi * 2.0
+    mid_a = a0 + da / 2.0
+    mid = (center[0] + math.cos(mid_a) * radius, center[1] + math.sin(mid_a) * radius)
+    if _point_in_ring(mid, ring):
+        da = da - math.pi * 2.0 if da > 0 else da + math.pi * 2.0
+    steps = max(6, int(math.ceil((abs(da) * radius) / 0.12)))
+    pts = []
+    for i in range(1, steps):
+        a = a0 + (da * i) / float(steps)
+        pts.append((center[0] + math.cos(a) * radius, center[1] + math.sin(a) * radius))
+    return pts
+
+
+def _offset_point(sample, delta, ring):
+    if delta <= 1e-6:
+        return sample["point"]
+    outward = _vmul(sample["inward"], -1.0)
+    probe = _vadd(sample["point"], _vmul(outward, min(0.2, delta)))
+    if _point_in_ring(probe, ring):
+        outward = _vmul(outward, -1.0)
+    return _vadd(sample["point"], _vmul(outward, delta))
+
+
+def _prepare_ring(points):
+    ring = _cap_ring(_ensure_ccw(_clean_ring(points)), MAX_SAMPLES)
+    if len(ring) < 3:
+        return (ring, [], 0.25)
+    perimeter = _ring_length(ring)
+    spacing = max(0.25, perimeter / float(MAX_SAMPLES))
+    samples = _sample_boundary(ring, spacing)
+    for sample in samples:
+        sample["width"] = _local_width(sample["point"], sample["inward"], ring, sample["edge"])
+    return (ring, samples, spacing)
+
+
+def _apply_min_width(ring, samples, spacing, min_width):
+    if len(ring) < 3 or min_width <= 0:
+        return (ring, 0)
+    if len(samples) < 3:
+        return (ring, 0)
+    raw = []
+    for sample in samples:
+        width = sample["width"]
+        if width == float("inf"):
+            raw.append(0.0)
+        else:
+            raw.append(max(0.0, (min_width - width) * 0.5))
+    if not any(d > 1e-4 for d in raw):
+        return (ring, 0)
+    sigma = max(1.2, (min_width * 0.55) / spacing)
+    deltas = _smooth_closed_values(raw, sigma)
+    pinches = _thin_runs([d > 0.04 for d in deltas])
+    moved = []
+    n = len(samples)
+    for i in range(n):
+        prev = samples[(i - 1 + n) % n]
+        curr = samples[i]
+        nxt = samples[(i + 1) % n]
+        t1 = _vunit(_vsub(curr["point"], prev["point"]))
+        t2 = _vunit(_vsub(nxt["point"], curr["point"]))
+        turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
+        delta = deltas[i]
+        p_off = _offset_point(curr, delta, ring)
+        if abs(turn) > 0.35 and delta > 0.05 and moved:
+            from_pt = _offset_point({"point": curr["point"], "inward": prev["inward"]}, delta, ring)
+            to_pt = _offset_point(curr, delta, ring)
+            if _vdist(from_pt, to_pt) > 0.08:
+                moved.append(from_pt)
+                moved.extend(_exterior_arc(curr["point"], from_pt, to_pt, delta, ring))
+        moved.append(p_off)
+    cleaned = _clean_ring(moved, 0.02)
+    return (cleaned if len(cleaned) >= 3 else ring, pinches)
+
+
+def ensure_min_width_ring(points, min_width):
+    """Widen only under-min-width stretches of a closed 2D ring.
+
+    points: list of (x, y). Returns (moved_points, pinches).
+    """
+    ring, samples, spacing = _prepare_ring(points)
+    return _apply_min_width(ring, samples, spacing, min_width)
 
 
 CMD_NAME = "PlasmaKerf"
@@ -219,188 +543,50 @@ def _signed_offset(curve, distance, corners, outward):
     return _offset(curve, plane, dist, corners)
 
 
-def _signed_area_approx(curve):
+def _to_xy(plane, pt):
+    vec = pt - plane.Origin
+    return (vec * plane.XAxis, vec * plane.YAxis)
+
+
+def _from_xy(plane, xy):
+    return plane.Origin + plane.XAxis * xy[0] + plane.YAxis * xy[1]
+
+
+def _curve_ring_xy(curve, plane, count):
+    """Sample a closed Rhino curve once. No per-sample GetLength."""
+    pts = []
     try:
-        amp = curve.ToPolyline(_tol(), _tol(), 0.0, 0.0)
-        if amp is None:
-            return 0.0
-        poly = amp.ToPolyline() if hasattr(amp, "ToPolyline") else amp
-        if poly is None or poly.Count < 3:
-            return 0.0
-        area = 0.0
-        count = poly.Count - 1 if poly.Count > 1 and poly[0].DistanceTo(poly[poly.Count - 1]) < _tol() else poly.Count
-        for i in range(count):
-            a = poly[i]
-            b = poly[(i + 1) % count]
-            area += a.X * b.Y - b.X * a.Y
-        return area * 0.5
+        ts = curve.DivideByCount(max(3, int(count)), True)
     except Exception:
-        try:
-            return abs(curve.GetBoundingBox(False).Area) * 0.25
-        except Exception:
-            return 0.0
+        ts = None
+    if ts:
+        for t in ts:
+            pts.append(_to_xy(plane, curve.PointAt(t)))
+    else:
+        domain = curve.Domain
+        steps = max(3, int(count))
+        for i in range(steps):
+            t = domain.Min + (domain.Max - domain.Min) * (i / float(steps))
+            pts.append(_to_xy(plane, curve.PointAt(t)))
+    return _ensure_ccw(_clean_ring(pts, max(_tol(), 0.02)))
 
 
-def _inward_at(curve, t, plane):
-    tan = _unitize(curve.TangentAt(t))
-    if tan is None:
+def _polyline_curve(plane, ring):
+    if len(ring) < 2:
         return None
-    inward = rg.Vector3d.CrossProduct(plane.Normal, tan)
-    if not inward.Unitize():
-        return None
+    pts = [_from_xy(plane, p) for p in ring]
+    pts.append(pts[0])
     try:
-        orientation = curve.ClosedCurveOrientation(plane)
-    except Exception:
-        orientation = rg.CurveOrientation.Undefined
-    if orientation == rg.CurveOrientation.Clockwise:
-        inward.Reverse()
-    return inward
-
-
-def _ray_width(curve, origin, direction):
-    if direction is None:
-        return None
-    try:
-        box = curve.GetBoundingBox(False)
-        span = box.Diagonal.Length
-    except Exception:
-        span = 1000.0
-    span = max(span, 1.0)
-    start = origin + direction * (_tol() * 8)
-    far = origin + direction * (span * 2.0 + 1.0)
-    probe = rg.LineCurve(start, far)
-    try:
-        events = rg.Intersect.Intersection.CurveCurve(curve, probe, _tol(), _tol())
-    except Exception:
-        events = None
-    if events is None or events.Count == 0:
-        return None
-    best = None
-    for i in range(events.Count):
-        try:
-            pt = events[i].PointA
-        except Exception:
-            continue
-        d = origin.DistanceTo(pt)
-        if d < _tol() * 12:
-            continue
-        if best is None or d < best:
-            best = d
-    return best
-
-
-def _inside_clearance(curve, origin, skip_t, plane):
-    """Nearest other wall whose connecting segment stays inside the opening."""
-    try:
-        length = curve.GetLength()
-    except Exception:
-        return None
-    if length < _tol() * 4:
-        return None
-    window = max(length * 0.04, min(length * 0.12, 4.0))
-    steps = max(48, int(math.ceil(length / 0.45)))
-    best = None
-    for i in range(steps):
-        t = curve.Domain.ParameterAt(i / float(steps)) if hasattr(curve.Domain, "ParameterAt") else (
-            curve.Domain.Min + (curve.Domain.Max - curve.Domain.Min) * (i / float(steps))
-        )
-        try:
-            along = abs(curve.GetLength(curve.Domain.Min, t) - curve.GetLength(curve.Domain.Min, skip_t))
-            along = min(along, length - along)
-        except Exception:
-            along = abs(t - skip_t)
-        if along < window:
-            continue
-        pt = curve.PointAt(t)
-        d = origin.DistanceTo(pt)
-        if d < _tol() * 8:
-            continue
-        if best is not None and d >= best:
-            continue
-        mid = rg.Point3d(
-            (origin.X + pt.X) * 0.5,
-            (origin.Y + pt.Y) * 0.5,
-            (origin.Z + pt.Z) * 0.5,
-        )
-        try:
-            contain = curve.Contains(mid, plane, _tol())
-        except Exception:
-            contain = None
-        if contain == rg.PointContainment.Inside:
-            best = d
-    return best
-
-
-def _union_closed(curves):
-    usable = [c for c in curves if c is not None]
-    if not usable:
-        return []
-    if len(usable) == 1:
-        return usable
-    try:
-        joined = rg.Curve.CreateBooleanUnion(usable, _tol())
-        got = [c for c in _as_list(joined) if c is not None]
-        if got:
-            return got
-    except Exception:
-        pass
-    return usable
-
-
-def _fair_closed_curve(pts, plane):
-    cleaned = []
-    for pt in pts:
-        if not cleaned or cleaned[-1].DistanceTo(pt) > 0.03:
-            cleaned.append(pt)
-    if len(cleaned) > 2 and cleaned[0].DistanceTo(cleaned[-1]) <= 0.03:
-        cleaned.pop()
-    if len(cleaned) < 3:
-        return None
-    curr = list(cleaned)
-    for _ in range(2):
-        nxt = []
-        n = len(curr)
-        for i in range(n):
-            a = curr[(i - 1) % n]
-            b = curr[i]
-            c = curr[(i + 1) % n]
-            nxt.append(rg.Point3d(
-                (a.X + b.X * 2.0 + c.X) / 4.0,
-                (a.Y + b.Y * 2.0 + c.Y) / 4.0,
-                (a.Z + b.Z * 2.0 + c.Z) / 4.0,
-            ))
-        curr = nxt
-    closed_pts = list(curr) + [curr[0]]
-    try:
-        fair = rg.Curve.CreateInterpolatedCurve(closed_pts, 3)
-        if fair is not None and fair.IsValid:
-            return fair
-    except Exception:
-        pass
-    try:
-        return rg.PolylineCurve(closed_pts)
+        return rg.PolylineCurve(pts)
     except Exception:
         return None
 
 
-def _smooth_closed_values(values, sigma):
-    if not values or sigma < 0.35:
-        return list(values)
-    radius = max(1, int(math.ceil(sigma * 3)))
-    kernel = []
-    total = 0.0
-    for i in range(-radius, radius + 1):
-        k = math.exp(-(i * i) / (2.0 * sigma * sigma))
-        kernel.append(k)
-        total += k
-    n = len(values)
-    out = []
-    for i in range(n):
-        acc = 0.0
-        for j in range(-radius, radius + 1):
-            acc += values[(i + j) % n] * kernel[j + radius]
-        out.append(acc / total)
-    return out
+_CLOSED_PREP = {}
+
+
+def _clear_closed_prep():
+    _CLOSED_PREP.clear()
 
 
 def _ensure_min_width(curve, min_width, corners):
@@ -413,73 +599,17 @@ def _ensure_min_width(curve, min_width, corners):
     if length < _tol() * 4:
         return [curve.DuplicateCurve()], 0, []
 
-    spacing = min(0.4, max(0.16, min_width / 24.0))
-    steps = max(64, int(math.ceil(length / spacing)))
-    domain = curve.Domain
-    samples = []
-    for i in range(steps):
-        t = domain.ParameterAt(i / float(steps)) if hasattr(domain, "ParameterAt") else (
-            domain.Min + (domain.Max - domain.Min) * (i / float(steps))
-        )
-        pt = curve.PointAt(t)
-        inward = _inward_at(curve, t, plane)
-        if inward is None:
-            continue
-        width = _ray_width(curve, pt, inward)
-        inside = _inside_clearance(curve, pt, t, plane)
-        if width is None and inside is None:
-            width = min_width
-        elif width is None:
-            width = inside
-        elif inside is not None:
-            width = min(width, inside)
-        samples.append((pt, inward, width, t))
-
-    raw = []
-    for _pt, _inward, width, _t in samples:
-        if width is None:
-            raw.append(0.0)
-        else:
-            raw.append(max(0.0, (min_width - width) * 0.5))
-    if not any(d > 1e-4 for d in raw):
-        return [curve.DuplicateCurve()], 0, []
-
-    sigma = max(1.2, (min_width * 0.55) / spacing)
-    deltas = _smooth_closed_values(raw, sigma)
-    pinches = 0
-    in_run = False
-    for d in deltas:
-        thin = d > 0.04
-        if thin and not in_run:
-            pinches += 1
-            in_run = True
-        elif not thin:
-            in_run = False
-    if deltas and deltas[0] > 0.04 and deltas[-1] > 0.04 and pinches >= 2:
-        pinches -= 1
-
-    moved = []
-    n = len(samples)
-    for i in range(n):
-        pt, inward, _width, _t = samples[i]
-        delta = deltas[i]
-        outward = rg.Vector3d(-inward.X, -inward.Y, -inward.Z)
-        if delta <= 1e-6:
-            moved.append(pt)
-            continue
-        probe = pt + outward * min(0.2, delta)
-        try:
-            contain = curve.Contains(probe, plane, _tol())
-        except Exception:
-            contain = None
-        if contain == rg.PointContainment.Inside:
-            outward.Reverse()
-        if not outward.Unitize():
-            moved.append(pt)
-            continue
-        moved.append(pt + outward * delta)
-
-    outline_curve = _fair_closed_curve(moved, plane)
+    key = id(curve)
+    prep = _CLOSED_PREP.get(key)
+    if prep is None:
+        count = min(MAX_SAMPLES, max(48, int(math.ceil(length / 0.35))))
+        ring = _curve_ring_xy(curve, plane, count)
+        ring, samples, spacing = _prepare_ring(ring)
+        prep = (plane, ring, samples, spacing)
+        _CLOSED_PREP[key] = prep
+    plane, ring, samples, spacing = prep
+    moved, pinches = _apply_min_width(ring, samples, spacing, min_width)
+    outline_curve = _polyline_curve(plane, moved)
     if outline_curve is None:
         return [curve.DuplicateCurve()], pinches, []
     if not outline_curve.IsClosed:
@@ -502,22 +632,14 @@ def compensate_curve(curve, min_width, kerf, caps, corners, mode):
     if curve is None:
         return [], [], "Invalid curve."
 
-    crv = curve.DuplicateCurve()
-    if crv is None:
-        return [], [], "Could not copy curve."
+    crv = curve
 
     if mode == "Slot":
         half = min_width * 0.5
         if half <= 0:
             return [], [], "MinWidth must be greater than 0."
         if crv.IsClosed:
-            area = abs(_signed_area_approx(crv))
-            if area < min_width * min_width * 0.2:
-                outline = _thicken_closed(crv, half, corners)
-                pinches = 0
-                thin_center = []
-            else:
-                outline, pinches, thin_center = _ensure_min_width(crv, min_width, corners)
+            outline, pinches, thin_center = _ensure_min_width(crv, min_width, corners)
         else:
             outline = _thicken_open(crv, half, corners, caps)
             pinches = 0
@@ -564,7 +686,14 @@ def compensate_curve(curve, min_width, kerf, caps, corners, mode):
     return outline, toolpath, None
 
 
-class KerfConduit(Rhino.Display.DisplayConduit):
+if HAS_RHINO:
+    _ConduitBase = Rhino.Display.DisplayConduit
+else:
+    class _ConduitBase(object):
+        pass
+
+
+class KerfConduit(_ConduitBase):
     def __init__(self):
         try:
             super(KerfConduit, self).__init__()
@@ -620,12 +749,24 @@ def _update_preview(conduit, curves, min_width, kerf, caps, corners, mode, outpu
     outlines = []
     toolpaths = []
     errors = []
-    for curve in curves:
-        out_c, tool_c, err = compensate_curve(curve, min_width, kerf, caps, corners, mode)
-        outlines.extend(out_c)
-        toolpaths.extend(tool_c)
-        if err:
-            errors.append(err)
+    redraw_was = True
+    try:
+        redraw_was = sc.doc.Views.RedrawEnabled
+        sc.doc.Views.RedrawEnabled = False
+    except Exception:
+        pass
+    try:
+        for curve in curves:
+            out_c, tool_c, err = compensate_curve(curve, min_width, kerf, caps, corners, mode)
+            outlines.extend(out_c)
+            toolpaths.extend(tool_c)
+            if err:
+                errors.append(err)
+    finally:
+        try:
+            sc.doc.Views.RedrawEnabled = redraw_was
+        except Exception:
+            pass
     conduit.outlines = outlines
     conduit.toolpaths = toolpaths
     conduit.show_outline = output in ("Both", "Outline")
@@ -659,6 +800,7 @@ def RunCommand():
     curves = _select_curves()
     if not curves:
         return Rhino.Commands.Result.Cancel
+    _clear_closed_prep()
 
     min_width = ric.OptionDouble(6.0, 0.01, 100000.0)
     kerf = ric.OptionDouble(1.5, 0.0, 100000.0)
@@ -670,8 +812,23 @@ def RunCommand():
     conduit = KerfConduit()
     conduit.Enabled = True
 
+    last_geom = [None]
+
     def refresh():
-        return _update_preview(
+        geom_key = (
+            min_width.CurrentValue,
+            kerf.CurrentValue,
+            CAP_NAMES[cap_index[0]],
+            CORNER_NAMES[corner_index[0]],
+            MODE_NAMES[mode_index[0]],
+        )
+        output = OUTPUT_NAMES[output_index[0]]
+        if last_geom[0] == geom_key and (conduit.outlines or conduit.toolpaths):
+            conduit.show_outline = output in ("Both", "Outline")
+            conduit.show_toolpath = output in ("Both", "Toolpath")
+            sc.doc.Views.Redraw()
+            return []
+        errors = _update_preview(
             conduit,
             curves,
             min_width.CurrentValue,
@@ -679,8 +836,10 @@ def RunCommand():
             CAP_NAMES[cap_index[0]],
             CORNER_NAMES[corner_index[0]],
             MODE_NAMES[mode_index[0]],
-            OUTPUT_NAMES[output_index[0]],
+            output,
         )
+        last_geom[0] = geom_key
+        return errors
 
     refresh()
     result = Rhino.Commands.Result.Cancel
@@ -748,5 +907,40 @@ def RunCommand():
     return result
 
 
+def _self_test():
+    def assert_true(cond, message):
+        if not cond:
+            raise AssertionError(message)
+
+    square = [(0.0, 0.0), (80.0, 0.0), (80.0, 70.0), (0.0, 70.0)]
+    moved, pinches = ensure_min_width_ring(square, 6.0)
+    xs = [p[0] for p in moved]
+    ys = [p[1] for p in moved]
+    assert_true(pinches == 0, "wide square should not pinch")
+    assert_true(max(xs) - min(xs) < 81.0, "wide square should stay ~80 wide")
+
+    thin = [(0.0, 0.0), (80.0, 0.0), (80.0, 3.0), (0.0, 3.0)]
+    moved, pinches = ensure_min_width_ring(thin, 6.0)
+    ys = [p[1] for p in moved]
+    xs = [p[0] for p in moved]
+    height = max(ys) - min(ys)
+    assert_true(pinches > 0, "thin slot should pinch")
+    assert_true(5.4 < height < 7.2, "thin slot height should be ~6, got {0}".format(height))
+    assert_true(max(xs) - min(xs) > 79.0, "thin slot should keep its length")
+
+    tiny = [(0.0, 0.0), (5.0, 0.0), (5.0, 1.0), (0.0, 1.0)]
+    moved, pinches = ensure_min_width_ring(tiny, 6.0)
+    xs = [p[0] for p in moved]
+    ys = [p[1] for p in moved]
+    assert_true(pinches > 0, "tiny closed slot should widen locally")
+    assert_true(max(ys) - min(ys) > 5.2, "tiny slot should reach min width")
+    assert_true(max(xs) - min(xs) < 12.0, "tiny slot should not become a stadium ribbon")
+
+    print("PlasmaKerf math tests passed")
+
+
 if __name__ == "__main__":
-    RunCommand()
+    if HAS_RHINO:
+        RunCommand()
+    else:
+        _self_test()
