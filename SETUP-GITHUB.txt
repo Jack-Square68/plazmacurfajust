@@ -1,0 +1,35 @@
+Set up this folder as your GitHub repo
+======================================
+
+You already created:
+  https://github.com/Jack-Square68/plazmacurfajust
+
+On your computer (Windows):
+1. Unzip this file. You should get a folder named plazmacurfajust.
+2. Open that folder.
+3. In the folder address bar, type: cmd
+   (or right-click empty space -> Open in Terminal)
+4. Run these commands, one at a time:
+
+   git init
+   git add .
+   git commit -m "Plasma kerf tool for Rhino"
+   git branch -M main
+   git remote add origin https://github.com/Jack-Square68/plazmacurfajust.git
+   git push -u origin main
+
+If git says the remote already has a README and refuses the push:
+
+   git push -u origin main --force
+
+That overwrites only this empty/starter GitHub repo with these files.
+
+Then the repo is live at:
+  https://github.com/Jack-Square68/plazmacurfajust
+
+Rhino script after unzip:
+  rhino\PlasmaKerf.py
+
+Web preview (optional):
+  npm install
+  npm run dev
