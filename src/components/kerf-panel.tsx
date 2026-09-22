@@ -20,6 +20,7 @@ type Props = {
   singlePass: boolean;
   pinches?: number;
   selectedClosed?: boolean;
+  importNote?: string | null;
 };
 
 export function KerfPanel({
@@ -32,6 +33,7 @@ export function KerfPanel({
   singlePass,
   pinches,
   selectedClosed,
+  importNote,
 }: Props) {
   const slot = params.mode === "slot";
 
@@ -43,8 +45,8 @@ export function KerfPanel({
         </p>
         <h2 className="mt-1 font-heading text-lg">Plasma kerf</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Click a red curve, then tune minimum width and kerf. Closed openings only
-          widen where they are under the minimum; the black outline is the finished cut.
+          Upload SVG or DXF, or click a red curve. Closed openings only widen where
+          they are under the minimum; the black outline is the finished cut.
         </p>
       </div>
 
@@ -230,6 +232,9 @@ export function KerfPanel({
             );
           })}
         </div>
+        {importNote && (
+          <p className="mt-2 text-xs text-muted-foreground">{importNote}</p>
+        )}
         {selected && PRESET_HINTS[selected.name] && (
           <p className="mt-2 text-xs text-muted-foreground">{PRESET_HINTS[selected.name]}</p>
         )}

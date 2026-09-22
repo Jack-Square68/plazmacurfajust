@@ -119,6 +119,7 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
     id: "line",
     name: "line",
     closed: false,
+    centerline: true,
     points: [
       { x: 0, y: 0 },
       { x: 40, y: 0 },
@@ -154,6 +155,36 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   const wide = koruPts.reduce((best, p) => (p.x > best.x ? p : best), koruPts[0]);
   const keep = distToPolyline(wide, { id: "o", name: "o", points: outline, closed: true });
   assert(keep < 0.6, `wide koru belly should stay on the original curve, drift=${keep}`);
+}
+
+// Tiny closed opening used to fall back to a full-loop stadium ribbon.
+{
+  const tiny = closed("tiny", [
+    { x: 0, y: 0 },
+    { x: 5, y: 0 },
+    { x: 5, y: 1 },
+    { x: 0, y: 1 },
+  ]);
+  const result = compensateCurve(tiny, params);
+  const b = boundsOf(result.outline.flat());
+  assert(result.pinches !== undefined && result.pinches > 0, "tiny closed slot should widen locally");
+  assert(!!b && b.maxY - b.minY > 5.2 && b.maxY - b.minY < 7.4, `tiny slot height ~6, got ${b ? b.maxY - b.minY : "?"}`);
+  assert(!!b && b.maxX - b.minX < 12, `tiny slot should not become a stadium around the loop, width=${b ? b.maxX - b.minX : "?"}`);
+}
+
+// Imported open strokes (no centerline flag) stay as drawn.
+{
+  const stroke: Polyline = {
+    id: "stroke",
+    name: "stroke",
+    closed: false,
+    points: [
+      { x: 0, y: 0 },
+      { x: 40, y: 0 },
+    ],
+  };
+  const result = compensateCurve(stroke, params);
+  assert(result.outline.length === 0, "imported open stroke should not stadium-offset");
 }
 
 console.log("offset tests passed");

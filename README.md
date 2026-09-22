@@ -14,7 +14,7 @@ Plasma burns a slot about as wide as the torch kerf. A skinny red centerline on 
 | You draw (red) | Tool builds (black) |
 | --- | --- |
 | Open centerline | Stadium / capsule of **Min width**, round or square caps (the whole path is under min width) |
-| Closed opening | Only stretches **narrower than Min width** are widened. Already-wide curves stay as drawn; thin tapers get a **smooth** min-width capsule with round ends |
+| Closed opening | Only stretches **narrower than Min width** are widened. Already-wide walls stay as drawn; thin tapers get a **smooth parallel offset** of the original curve |
 | Part profile | Torch path **outside** by kerf / 2 |
 | Hole profile | Torch path **inside** by kerf / 2 |
 
@@ -29,10 +29,13 @@ npm run dev
 
 Open [http://127.0.0.1:43147](http://127.0.0.1:43147).
 
+- **Upload** an SVG or DXF (or drop it on the canvas). Closed openings stay on the original curve except where they are under **Minimum width**
 - Click a red curve
 - Drag **Minimum width** and **Kerf width**
 - Draw your own polyline with the pen (`D`), Enter to finish, `C` to close
 - Export **DXF for Rhino** (layers `ORIGINAL`, `KERF_OUTLINE`, `KERF_TOOLPATH`, units mm)
+
+Nearly-closed paths auto-close. Open strokes from a file are left as drawn — they are not thickened into a stadium. Demo centerlines (Straight / Dogleg / J-hook) still thicken the whole path.
 
 ## Install in Rhino
 

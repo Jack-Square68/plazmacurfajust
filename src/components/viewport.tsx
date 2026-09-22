@@ -13,6 +13,7 @@ type Props = {
   selectedId: string | null;
   params: KerfParams;
   compensated: Compensated | null;
+  compensations?: Map<string, Compensated>;
   camera: Camera;
   tool: Tool;
   spacePan: boolean;
@@ -37,6 +38,7 @@ export function Viewport({
   selectedId,
   params,
   compensated,
+  compensations,
   camera,
   tool,
   spacePan,
@@ -83,12 +85,13 @@ export function Viewport({
       curves: curvesRef.current,
       selectedId: selectedRef.current,
       compensated,
+      compensations,
       params,
       draft,
       hoverWorld,
       tool: toolRef.current,
     });
-  }, [compensated, params, draft, hoverWorld]);
+  }, [compensated, compensations, params, draft, hoverWorld]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -267,6 +270,7 @@ type Scene = {
   curves: Polyline[];
   selectedId: string | null;
   compensated: Compensated | null;
+  compensations?: Map<string, Compensated>;
   params: KerfParams;
   draft: Draft | null;
   hoverWorld: Point | null;
@@ -278,6 +282,16 @@ function drawScene(ctx: CanvasRenderingContext2D, s: Scene) {
   ctx.fillRect(0, 0, s.width, s.height);
   drawGrid(ctx, s);
   drawAxes(ctx, s);
+
+  if (s.compensations) {
+    for (const curve of s.curves) {
+      if (curve.id === s.selectedId) continue;
+      const extra = s.compensations.get(curve.id);
+      if (!extra?.outline.length || s.params.output === "toolpath") continue;
+      drawFilled(ctx, s.camera, extra.outline, "rgba(17,17,17,0.06)");
+      strokePaths(ctx, s.camera, extra.outline, "#2a2a2a", 1.5, true, []);
+    }
+  }
 
   if (s.compensated) {
     if (s.params.output !== "toolpath") {

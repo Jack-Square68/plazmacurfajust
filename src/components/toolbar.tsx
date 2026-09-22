@@ -16,6 +16,7 @@ import {
   PenLine,
   RotateCcw,
   Trash2,
+  Upload,
 } from "lucide-react";
 
 type Props = {
@@ -26,6 +27,7 @@ type Props = {
   onDelete: () => void;
   onExportDxf: () => void;
   onExportSvg: () => void;
+  onUpload: (files: FileList | File[]) => void;
   canDelete: boolean;
 };
 
@@ -52,6 +54,7 @@ export function Toolbar({
   onDelete,
   onExportDxf,
   onExportSvg,
+  onUpload,
   canDelete,
 }: Props) {
   return (
@@ -100,6 +103,24 @@ export function Toolbar({
         </Button>
       </Tip>
       <div className="ml-auto flex items-center gap-1.5">
+        <Tip label="Upload SVG or DXF openings">
+          <Button variant="outline" size="sm" asChild>
+            <label className="cursor-pointer">
+              <Upload />
+              Upload
+              <input
+                type="file"
+                accept=".svg,.dxf,image/svg+xml"
+                className="hidden"
+                multiple
+                onChange={(e) => {
+                  if (e.target.files?.length) onUpload(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+          </Button>
+        </Tip>
         <Button variant="outline" size="sm" onClick={onExportSvg}>
           <Download />
           SVG

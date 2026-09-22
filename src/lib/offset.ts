@@ -10,9 +10,9 @@ import {
   midpoint,
   mul,
   pointInPolygon,
+  polylineLength,
   raySegmentT,
   rotateLeft,
-  signedArea,
   smoothClosedValues,
   sub,
   unit,
@@ -253,7 +253,9 @@ export function ensureMinWidth(
     return { outline: ring.length >= 3 ? [ring] : [], pinches: 0, centerlines: [] };
   }
 
-  const spacing = Math.min(0.4, Math.max(0.16, minWidth / 24));
+  const perimeter = polylineLength(ring, true);
+  const target = Math.min(0.4, Math.max(0.16, minWidth / 24));
+  const spacing = perimeter > 720 * target ? perimeter / 720 : target;
   const samples: WidthSample[] = sampleBoundary(ring, spacing).map((s) => ({
     ...s,
     width: localWidth(s.point, s.inward, ring, s.edge),
@@ -333,12 +335,6 @@ function compensateClosedSlot(cleaned: Point[], params: KerfParams): Compensated
   const minWidth = params.minWidth;
   if (minWidth <= 0) {
     return { outline: [], toolpath: [], singlePass: false, error: "Minimum width must be greater than 0." };
-  }
-
-  const area = Math.abs(signedArea(cleaned));
-  const tooThinToBeARegion = area < minWidth * minWidth * 0.2;
-  if (tooThinToBeARegion) {
-    return compensateCenterline(cleaned, true, params);
   }
 
   const grown = ensureMinWidth(cleaned, minWidth, params.join);
@@ -432,7 +428,10 @@ export function compensateCurve(curve: Polyline, params: KerfParams): Compensate
     if (curve.closed && cleaned.length >= 3) {
       return compensateClosedSlot(cleaned, params);
     }
-    return compensateCenterline(cleaned, curve.closed, params);
+    if (curve.centerline) {
+      return compensateCenterline(cleaned, curve.closed, params);
+    }
+    return { outline: [], toolpath: [], singlePass: false };
   }
 
   if (!curve.closed) {

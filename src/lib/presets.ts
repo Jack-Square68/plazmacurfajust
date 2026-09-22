@@ -1,8 +1,13 @@
 import { add, mul, rotateLeft, sub, uid, unit } from "./geometry";
 import type { Point, Polyline } from "./types";
 
-function curve(name: string, points: { x: number; y: number }[], closed = false): Polyline {
-  return { id: uid("crv"), name, points, closed };
+function curve(
+  name: string,
+  points: { x: number; y: number }[],
+  closed = false,
+  centerline = false,
+): Polyline {
+  return { id: uid("crv"), name, points, closed, centerline };
 }
 
 function arc(
@@ -58,14 +63,14 @@ export function createDemoCurves(): Polyline[] {
     curve("Straight slot", [
       { x: 40, y: 210 },
       { x: 220, y: 210 },
-    ]),
+    ], false, true),
     curve("Dogleg slot", [
       { x: 40, y: 150 },
       { x: 120, y: 150 },
       { x: 120, y: 92 },
       { x: 210, y: 92 },
-    ]),
-    curve("J-hook slot", hook),
+    ], false, true),
+    curve("J-hook slot", hook, false, true),
     curve("Tapered koru", taperingKoru(), true),
     curve(
       "Pinched opening",

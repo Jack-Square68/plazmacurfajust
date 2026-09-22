@@ -11,6 +11,8 @@ export type Polyline = {
   name: string;
   points: Point[];
   closed: boolean;
+  /** Open demo / drawn slot path: thicken the whole centerline. Imports never set this. */
+  centerline?: boolean;
 };
 
 export type KerfParams = {

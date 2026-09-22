@@ -10,10 +10,12 @@ import { fitCurves } from "@/lib/camera";
 import type { Camera } from "@/lib/camera";
 import { curvesToDxf, curvesToSvg, downloadText } from "@/lib/export";
 import { polylineLength, uid } from "@/lib/geometry";
+import { importVectorFile, pickDefaultImport } from "@/lib/import-vector";
 import { compensateCurve } from "@/lib/offset";
 import { createDemoCurves } from "@/lib/presets";
 import {
   DEFAULT_PARAMS,
+  type Compensated,
   type KerfParams,
   type Point,
   type Polyline,
@@ -24,9 +26,20 @@ type Draft = { points: Point[]; closed: boolean };
 
 const bootstrapCurves = createDemoCurves();
 
+function defaultSelection(list: Polyline[]): string | null {
+  return (
+    list.find((c) => c.name === "Tapered koru") ??
+    list.find((c) => c.closed) ??
+    list[0] ??
+    null
+  )?.id ?? null;
+}
+
 export function KerfApp() {
   const [curves, setCurves] = useState<Polyline[]>(bootstrapCurves);
-  const [selectedId, setSelectedId] = useState<string | null>(bootstrapCurves[0]?.id ?? null);
+  const [selectedId, setSelectedId] = useState<string | null>(defaultSelection(bootstrapCurves));
+  const [importNote, setImportNote] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
   const [params, setParams] = useState<KerfParams>(DEFAULT_PARAMS);
   const [tool, setTool] = useState<Tool>("select");
   const [spacePan, setSpacePan] = useState(false);
@@ -75,10 +88,15 @@ export function KerfApp() {
 
   const selected = curves.find((c) => c.id === selectedId) ?? null;
 
-  const compensated = useMemo(() => {
-    if (!selected) return null;
-    return compensateCurve(selected, params);
-  }, [selected, params]);
+  const compensations = useMemo(() => {
+    const map = new Map<string, Compensated>();
+    for (const curve of curves) {
+      map.set(curve.id, compensateCurve(curve, paramsFor(curve, params)));
+    }
+    return map;
+  }, [curves, params]);
+
+  const compensated = selected ? compensations.get(selected.id) ?? null : null;
 
   const fit = useCallback(() => {
     const el = stageRef.current;
@@ -90,12 +108,49 @@ export function KerfApp() {
   const reset = () => {
     const next = createDemoCurves();
     setCurves(next);
-    setSelectedId(next[0]?.id ?? null);
+    setSelectedId(defaultSelection(next));
     setDraft(null);
     didFit.current = false;
     setParams(DEFAULT_PARAMS);
     setTool("select");
+    setImportNote(null);
   };
+
+  const fitTo = useCallback((list: Polyline[]) => {
+    const el = stageRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    setCamera(fitCurves(list, rect.width, rect.height));
+  }, []);
+
+  const onUpload = useCallback(async (files: FileList | File[]) => {
+    const loaded: Polyline[] = [];
+    const warnings: string[] = [];
+    for (const file of Array.from(files)) {
+      const result = await importVectorFile(file);
+      warnings.push(...result.warnings);
+      loaded.push(...result.curves);
+    }
+    if (loaded.length === 0) {
+      setImportNote(warnings[0] ?? "No curves found in that file.");
+      return;
+    }
+    setCurves(loaded);
+    const pick = pickDefaultImport(loaded);
+    setSelectedId(pick?.id ?? null);
+    setParams((current) => ({ ...current, mode: "slot" }));
+    setDraft(null);
+    setTool("select");
+    const closed = loaded.filter((c) => c.closed).length;
+    const open = loaded.length - closed;
+    setImportNote(
+      warnings[0] ??
+        (open
+          ? `${closed} closed opening${closed === 1 ? "" : "s"}, ${open} open stroke${open === 1 ? "" : "s"} (open strokes stay as drawn).`
+          : `${closed} closed opening${closed === 1 ? "" : "s"} — only stretches under min width grow.`),
+    );
+    requestAnimationFrame(() => fitTo(loaded));
+  }, [fitTo]);
 
   const finishDraft = useCallback(
     (closed: boolean) => {
@@ -108,6 +163,7 @@ export function KerfApp() {
         name: closed ? "Drawn loop" : "Drawn curve",
         points: draft.points,
         closed,
+        centerline: !closed,
       };
       setCurves((prev) => [...prev, curve]);
       setSelectedId(curve.id);
@@ -218,13 +274,27 @@ export function KerfApp() {
             <h1 className="font-heading text-xl leading-tight tracking-tight">Kerf</h1>
           </div>
           <p className="hidden max-w-xl text-sm text-muted-foreground sm:block">
-            Widen only the parts of an opening that fall under the minimum width, then
-            account for torch kerf. Open centerlines still thicken the whole path.
+            Upload an SVG or DXF opening. Only stretches under the minimum width grow;
+            wide walls stay on the original curve.
           </p>
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div
+            className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+            onDragOver={(e) => {
+              if ([...e.dataTransfer.items].some((item) => item.kind === "file")) {
+                e.preventDefault();
+                setDragOver(true);
+              }
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              if (e.dataTransfer.files.length) void onUpload(e.dataTransfer.files);
+            }}
+          >
             <div className="border-b px-3 py-2">
               <Toolbar
                 tool={tool}
@@ -239,6 +309,7 @@ export function KerfApp() {
                 }}
                 onExportDxf={() => exportAll("dxf")}
                 onExportSvg={() => exportAll("svg")}
+                onUpload={onUpload}
                 canDelete={Boolean(selectedId)}
               />
             </div>
@@ -248,6 +319,7 @@ export function KerfApp() {
                 selectedId={selectedId}
                 params={params}
                 compensated={compensated}
+                compensations={compensations}
                 camera={camera}
                 tool={spacePan ? "pan" : tool}
                 spacePan={spacePan}
@@ -270,6 +342,13 @@ export function KerfApp() {
                 </span>
               )}
             </div>
+            {dragOver && (
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/70">
+                <p className="rounded-lg border border-dashed border-foreground/40 bg-card px-4 py-3 text-sm">
+                  Drop SVG or DXF to load openings
+                </p>
+              </div>
+            )}
           </div>
           <KerfPanel
             params={params}
@@ -281,6 +360,7 @@ export function KerfApp() {
             singlePass={Boolean(compensated?.singlePass)}
             pinches={compensated?.pinches}
             selectedClosed={Boolean(selected?.closed)}
+            importNote={importNote}
           />
         </div>
       </div>
