@@ -9,8 +9,9 @@ Rhino 7 / 8
 -----------
 Closed openings are sampled once to a polyline (capped) for width, then
 the original curve is offset along its own normals and rebuilt as a
-degree-3 NURBS. Rhino is not asked to CurveCurve / GetLength / Contains
-on every sample, so a koru no longer locks the UI.
+degree-3 NURBS. Hairpin tips tighter than the offset become a round cap
+instead of a self-intersecting loop. Rhino is not asked to CurveCurve /
+GetLength / Contains on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -304,6 +305,144 @@ def _offset_point(sample, delta, ring):
     return _vadd(sample["point"], _vmul(outward, delta))
 
 
+def _point_radius(prev, curr, nxt):
+    t1 = _vunit(_vsub(curr, prev))
+    t2 = _vunit(_vsub(nxt, curr))
+    turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
+    ds = 0.5 * (_vdist(prev, curr) + _vdist(curr, nxt))
+    if abs(turn) < 1e-4:
+        return 1e9, turn
+    return abs(ds / turn), turn
+
+
+def _seg_intersect(a, b, c, d):
+    """Return intersection point of proper overlap, else None."""
+    ab = _vsub(b, a)
+    cd = _vsub(d, c)
+    den = _vcross(ab, cd)
+    if abs(den) < 1e-12:
+        return None
+    ac = _vsub(c, a)
+    t = _vcross(ac, cd) / den
+    u = _vcross(ac, ab) / den
+    if t <= 1e-6 or t >= 1.0 - 1e-6 or u <= 1e-6 or u >= 1.0 - 1e-6:
+        return None
+    return (a[0] + ab[0] * t, a[1] + ab[1] * t)
+
+
+def _polyline_self_intersects(pts):
+    n = len(pts)
+    if n < 4:
+        return False
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            if _seg_intersect(a, b, pts[j], pts[(j + 1) % n]) is not None:
+                return True
+    return False
+
+
+def _remove_loops(pts):
+    """Cut bowtie / tip loops out of a closed ring."""
+    guard = 0
+    while guard < 12:
+        guard += 1
+        n = len(pts)
+        if n < 4:
+            return pts
+        found = None
+        for i in range(n):
+            a = pts[i]
+            b = pts[(i + 1) % n]
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1:
+                    continue
+                hit = _seg_intersect(a, b, pts[j], pts[(j + 1) % n])
+                if hit is None:
+                    continue
+                loop_a = (j - i) % n
+                loop_b = n - loop_a
+                found = (i, j, hit, loop_a <= loop_b)
+                break
+            if found:
+                break
+        if not found:
+            return pts
+        i, j, hit, keep_short = found
+        if keep_short:
+            # drop the short loop between i+1 and j
+            nxt = pts[: i + 1] + [hit] + pts[j + 1 :]
+        else:
+            nxt = [hit] + pts[i + 1 : j + 1]
+        nxt = _clean_ring(nxt, 0.02)
+        if len(nxt) < 3 or len(nxt) >= n:
+            return pts
+        pts = nxt
+    return pts
+
+
+def _offset_with_tip_caps(samples, deltas, ring):
+    """Offset along normals, but replace hairpins that would loop with a round cap."""
+    n = len(samples)
+    offs = [_offset_point(samples[i], deltas[i], ring) for i in range(n)]
+    tight = []
+    for i in range(n):
+        radius, turn = _point_radius(
+            samples[(i - 1 + n) % n]["point"],
+            samples[i]["point"],
+            samples[(i + 1) % n]["point"],
+        )
+        cusp = deltas[i] > 0.05 and (radius < deltas[i] * 1.45 or abs(turn) > 2.15)
+        tight.append(cusp)
+    if any(tight):
+        dilated = list(tight)
+        for i in range(n):
+            if tight[i]:
+                for j in ((i - 1 + n) % n, (i + 1) % n):
+                    if deltas[j] > 0.04:
+                        dilated[j] = True
+        tight = dilated
+    if not any(tight) or all(tight):
+        return offs
+
+    start = 0
+    for i in range(n):
+        if not tight[i]:
+            start = i
+            break
+
+    out = []
+    i = 0
+    while i < n:
+        idx = (start + i) % n
+        if not tight[idx]:
+            out.append(offs[idx])
+            i += 1
+            continue
+        run = 0
+        while i + run < n and tight[(start + i + run) % n]:
+            run += 1
+        from_pt = out[-1] if out else offs[(start + i - 1) % n]
+        after = (start + i + run) % n
+        to_pt = offs[after]
+        best_k = (start + i) % n
+        best_d = deltas[best_k]
+        for k in range(run):
+            kk = (start + i + k) % n
+            if deltas[kk] >= best_d:
+                best_d = deltas[kk]
+                best_k = kk
+        center = samples[best_k]["point"]
+        radius = max(best_d, 0.15)
+        if _vdist(from_pt, to_pt) > 0.06:
+            out.extend(_exterior_arc(center, from_pt, to_pt, radius, ring))
+        i += run
+    return out if len(out) >= 3 else offs
+
+
 def _prepare_ring(points):
     ring = _cap_ring(_ensure_ccw(_clean_ring(points)), MAX_SAMPLES)
     if len(ring) < 3:
@@ -346,25 +485,29 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
     sigma = max(1.2, (min_width * 0.55) / spacing)
     deltas = _smooth_closed_values(raw, sigma)
     pinches = _thin_runs([d > 0.04 for d in deltas])
-    moved = []
-    n = len(samples)
-    for i in range(n):
-        prev = samples[(i - 1 + n) % n]
-        curr = samples[i]
-        nxt = samples[(i + 1) % n]
-        t1 = _vunit(_vsub(curr["point"], prev["point"]))
-        t2 = _vunit(_vsub(nxt["point"], curr["point"]))
-        turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
-        delta = deltas[i]
-        p_off = _offset_point(curr, delta, ring)
-        if round_corners and abs(turn) > 0.35 and delta > 0.05 and moved:
-            from_pt = _offset_point({"point": curr["point"], "inward": prev["inward"]}, delta, ring)
-            to_pt = _offset_point(curr, delta, ring)
-            if _vdist(from_pt, to_pt) > 0.08:
-                moved.append(from_pt)
-                moved.extend(_exterior_arc(curr["point"], from_pt, to_pt, delta, ring))
-        moved.append(p_off)
-    cleaned = _clean_ring(moved, 0.02)
+    if not round_corners:
+        moved = _offset_with_tip_caps(samples, deltas, ring)
+    else:
+        moved = []
+        n = len(samples)
+        for i in range(n):
+            prev = samples[(i - 1 + n) % n]
+            curr = samples[i]
+            nxt = samples[(i + 1) % n]
+            t1 = _vunit(_vsub(curr["point"], prev["point"]))
+            t2 = _vunit(_vsub(nxt["point"], curr["point"]))
+            turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
+            delta = deltas[i]
+            p_off = _offset_point(curr, delta, ring)
+            if abs(turn) > 0.35 and delta > 0.05 and moved:
+                from_pt = _offset_point({"point": curr["point"], "inward": prev["inward"]}, delta, ring)
+                to_pt = _offset_point(curr, delta, ring)
+                if _vdist(from_pt, to_pt) > 0.08:
+                    moved.append(from_pt)
+                    moved.extend(_exterior_arc(curr["point"], from_pt, to_pt, delta, ring))
+            moved.append(p_off)
+        moved = _offset_with_tip_caps(samples, deltas, ring) if _polyline_self_intersects(moved) else moved
+    cleaned = _remove_loops(_clean_ring(moved, 0.02))
     return (cleaned if len(cleaned) >= 3 else ring, pinches)
 
 
@@ -629,36 +772,47 @@ def _samples_from_curve(curve, plane, ring, count):
     return samples
 
 
+def _curve_self_intersects(curve):
+    try:
+        events = rg.Intersect.Intersection.CurveSelf(curve, max(_tol(), 0.02))
+        return events is not None and events.Count > 0
+    except Exception:
+        return False
+
+
 def _interpolated_closed(plane, ring):
-    """Degree-3 periodic NURBS through the offset points — not a polyline."""
+    """Degree-3 NURBS through the offset points. Reject a looped interpolation."""
     if len(ring) < 4:
         return _polyline_curve(plane, ring)
     pts = [_from_xy(plane, p) for p in ring]
+    candidates = []
     styles = []
     try:
+        styles.append(rg.CurveKnotStyle.Chord)
         styles.append(rg.CurveKnotStyle.ChordPeriodic)
-        styles.append(rg.CurveKnotStyle.UniformPeriodic)
     except Exception:
         pass
     for style in styles:
         try:
             crv = rg.Curve.CreateInterpolatedCurve(pts, 3, style)
             if crv is not None and crv.IsValid:
-                if not crv.IsClosed:
-                    try:
-                        crv.MakeClosed(_tol() * 4)
-                    except Exception:
-                        pass
-                return crv
+                candidates.append(crv)
         except Exception:
             pass
     try:
-        closed_pts = list(pts) + [pts[0]]
-        crv = rg.Curve.CreateInterpolatedCurve(closed_pts, 3)
+        crv = rg.Curve.CreateInterpolatedCurve(list(pts) + [pts[0]], 3)
         if crv is not None and crv.IsValid:
-            return crv
+            candidates.append(crv)
     except Exception:
         pass
+    for crv in candidates:
+        if not crv.IsClosed:
+            try:
+                crv.MakeClosed(_tol() * 4)
+            except Exception:
+                pass
+        if crv.IsValid and not _curve_self_intersects(crv):
+            return crv
     return _polyline_curve(plane, ring)
 
 
@@ -1020,6 +1174,21 @@ def _self_test():
     assert_true(pinches > 0, "tiny closed slot should widen locally")
     assert_true(max(ys) - min(ys) > 5.2, "tiny slot should reach min width")
     assert_true(max(xs) - min(xs) < 12.0, "tiny slot should not become a stadium ribbon")
+
+    hairpin = []
+    for y in range(0, 41):
+        hairpin.append((0.0, float(y)))
+    for i in range(1, 17):
+        a = math.pi * 0.5 - i * math.pi / 16.0
+        hairpin.append((0.5 + 0.5 * math.cos(a), 40.0 + 0.5 * math.sin(a)))
+    for y in range(40, -1, -1):
+        hairpin.append((1.0, float(y)))
+    ring, samples, spacing = _prepare_ring(hairpin)
+    moved, pinches = _apply_min_width(ring, samples, spacing, 6.0, round_corners=False)
+    ys = [p[1] for p in moved]
+    assert_true(pinches > 0, "hairpin tip should be under min width")
+    assert_true(not _polyline_self_intersects(moved), "hairpin tip must not loop")
+    assert_true(max(ys) > 42.0, "hairpin tip should grow to a round cap, maxY={0}".format(max(ys)))
 
     print("PlasmaKerf math tests passed")
 
