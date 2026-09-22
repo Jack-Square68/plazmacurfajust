@@ -289,6 +289,48 @@ def _ray_width(curve, origin, direction):
     return best
 
 
+def _inside_clearance(curve, origin, skip_t, plane):
+    """Nearest other wall whose connecting segment stays inside the opening."""
+    try:
+        length = curve.GetLength()
+    except Exception:
+        return None
+    if length < _tol() * 4:
+        return None
+    window = max(length * 0.04, min(length * 0.12, 4.0))
+    steps = max(48, int(math.ceil(length / 0.45)))
+    best = None
+    for i in range(steps):
+        t = curve.Domain.ParameterAt(i / float(steps)) if hasattr(curve.Domain, "ParameterAt") else (
+            curve.Domain.Min + (curve.Domain.Max - curve.Domain.Min) * (i / float(steps))
+        )
+        try:
+            along = abs(curve.GetLength(curve.Domain.Min, t) - curve.GetLength(curve.Domain.Min, skip_t))
+            along = min(along, length - along)
+        except Exception:
+            along = abs(t - skip_t)
+        if along < window:
+            continue
+        pt = curve.PointAt(t)
+        d = origin.DistanceTo(pt)
+        if d < _tol() * 8:
+            continue
+        if best is not None and d >= best:
+            continue
+        mid = rg.Point3d(
+            (origin.X + pt.X) * 0.5,
+            (origin.Y + pt.Y) * 0.5,
+            (origin.Z + pt.Z) * 0.5,
+        )
+        try:
+            contain = curve.Contains(mid, plane, _tol())
+        except Exception:
+            contain = None
+        if contain == rg.PointContainment.Inside:
+            best = d
+    return best
+
+
 def _union_closed(curves):
     usable = [c for c in curves if c is not None]
     if not usable:
@@ -372,8 +414,13 @@ def _ensure_min_width(curve, min_width, corners):
         pt = curve.PointAt(t)
         inward = _inward_at(curve, t, plane)
         width = _ray_width(curve, pt, inward)
-        if width is None:
+        inside = _inside_clearance(curve, pt, t, plane)
+        if width is None and inside is None:
             continue
+        if width is None:
+            width = inside
+        elif inside is not None:
+            width = min(width, inside)
         samples.append((pt, inward, width, t))
 
     thin = [s[2] < min_width - 1e-4 for s in samples]

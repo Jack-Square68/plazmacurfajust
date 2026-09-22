@@ -3,9 +3,12 @@ import * as ClipperNS from "clipper-lib";
 import {
   add,
   cleanPoints,
+  closestOnSegment,
   dist,
   ensureCcw,
+  midpoint,
   mul,
+  pointInPolygon,
   raySegmentT,
   rotateLeft,
   signedArea,
@@ -187,11 +190,18 @@ function sampleBoundary(points: Point[], spacing: number): Omit<WidthSample, "wi
 }
 
 function localWidth(origin: Point, inward: Point, ring: Point[], skipEdge: number): number {
+  const n = ring.length;
   let best = Infinity;
-  for (let i = 0; i < ring.length; i++) {
-    if (i === skipEdge) continue;
-    const t = raySegmentT(origin, inward, ring[i], ring[(i + 1) % ring.length]);
-    if (t !== null && t < best) best = t;
+  for (let i = 0; i < n; i++) {
+    const wrap = Math.min(Math.abs(i - skipEdge), n - Math.abs(i - skipEdge));
+    if (wrap <= 1) continue;
+    const hit = raySegmentT(origin, inward, ring[i], ring[(i + 1) % n]);
+    if (hit !== null && hit < best) best = hit;
+    const close = closestOnSegment(origin, ring[i], ring[(i + 1) % n]);
+    const gap = dist(origin, close);
+    if (gap >= best || gap < 1e-4) continue;
+    const mid = midpoint(origin, close);
+    if (pointInPolygon(mid, ring) && gap < best) best = gap;
   }
   return best;
 }

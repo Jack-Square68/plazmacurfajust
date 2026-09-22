@@ -93,6 +93,26 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   assert(!!b && b.maxX - b.minX > 79, "thin slot should not shrink in length");
 }
 
+// Hourglass pinch — concave neck is thinner than min width.
+{
+  const pinch = closed("pinch", [
+    { x: 20, y: 8 },
+    { x: 58, y: 8 },
+    { x: 72, y: 22 },
+    { x: 86, y: 8 },
+    { x: 124, y: 8 },
+    { x: 124, y: 32 },
+    { x: 86, y: 32 },
+    { x: 72, y: 18 },
+    { x: 58, y: 32 },
+    { x: 20, y: 32 },
+  ]);
+  const grown = ensureMinWidth(pinch.points, minWidth);
+  assert(grown.pinches > 0, `hourglass neck should be under min width, pinches=${grown.pinches}`);
+  const neck = localSpan(grown.outline.flat(), { x: 72, y: 20 }, 10);
+  assert(neck > 5.2, `hourglass neck should grow toward 6 mm, got ${neck}`);
+}
+
 // Open centerline still thickens the whole path.
 {
   const line: Polyline = {

@@ -96,13 +96,17 @@ export function boundsOfPolylines(curves: Polyline[]): {
   return boundsOf(pts);
 }
 
-export function distToSegment(p: Point, a: Point, b: Point): number {
+export function closestOnSegment(p: Point, a: Point, b: Point): Point {
   const ab = sub(b, a);
   const ap = sub(p, a);
   const ab2 = ab.x * ab.x + ab.y * ab.y;
-  if (ab2 < 1e-18) return dist(p, a);
+  if (ab2 < 1e-18) return a;
   const t = Math.max(0, Math.min(1, (ap.x * ab.x + ap.y * ab.y) / ab2));
-  return dist(p, { x: a.x + ab.x * t, y: a.y + ab.y * t });
+  return { x: a.x + ab.x * t, y: a.y + ab.y * t };
+}
+
+export function distToSegment(p: Point, a: Point, b: Point): number {
+  return dist(p, closestOnSegment(p, a, b));
 }
 
 export function distToPolyline(p: Point, curve: Polyline): number {
