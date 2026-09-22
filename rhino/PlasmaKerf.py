@@ -9,8 +9,9 @@ Rhino 7 / 8
 -----------
 Closed openings are sampled once to a polyline (capped) for width, then
 the original curve is offset along its own normals and rebuilt as a
-degree-3 NURBS. Rhino is not asked to CurveCurve / GetLength / Contains
-on every sample, so a koru no longer locks the UI.
+degree-3 NURBS. Sharp corners get a simple wall-to-wall radius — they are not
+wrapped into a bulge around the original vertex. Rhino is not asked to CurveCurve /
+GetLength / Contains on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -304,6 +305,135 @@ def _offset_point(sample, delta, ring):
     return _vadd(sample["point"], _vmul(outward, delta))
 
 
+def _seg_intersect(a, b, c, d):
+    """Return intersection point of proper overlap, else None."""
+    ab = _vsub(b, a)
+    cd = _vsub(d, c)
+    den = _vcross(ab, cd)
+    if abs(den) < 1e-12:
+        return None
+    ac = _vsub(c, a)
+    t = _vcross(ac, cd) / den
+    u = _vcross(ac, ab) / den
+    if t <= 1e-6 or t >= 1.0 - 1e-6 or u <= 1e-6 or u >= 1.0 - 1e-6:
+        return None
+    return (a[0] + ab[0] * t, a[1] + ab[1] * t)
+
+
+def _polyline_self_intersects(pts):
+    n = len(pts)
+    if n < 4:
+        return False
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            if _seg_intersect(a, b, pts[j], pts[(j + 1) % n]) is not None:
+                return True
+    return False
+
+
+def _remove_loops(pts):
+    """Cut bowtie / tip loops out of a closed ring."""
+    guard = 0
+    while guard < 12:
+        guard += 1
+        n = len(pts)
+        if n < 4:
+            return pts
+        found = None
+        for i in range(n):
+            a = pts[i]
+            b = pts[(i + 1) % n]
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1:
+                    continue
+                hit = _seg_intersect(a, b, pts[j], pts[(j + 1) % n])
+                if hit is None:
+                    continue
+                loop_a = (j - i) % n
+                loop_b = n - loop_a
+                found = (i, j, hit, loop_a <= loop_b)
+                break
+            if found:
+                break
+        if not found:
+            return pts
+        i, j, hit, keep_short = found
+        if keep_short:
+            # drop the short loop between i+1 and j
+            nxt = pts[: i + 1] + [hit] + pts[j + 1 :]
+        else:
+            nxt = [hit] + pts[i + 1 : j + 1]
+        nxt = _clean_ring(nxt, 0.02)
+        if len(nxt) < 3 or len(nxt) >= n:
+            return pts
+        pts = nxt
+    return pts
+
+
+def _arc_points(center, start, end, radius, ring):
+    pts = _exterior_arc(center, start, end, radius, ring)
+    return pts
+
+
+def _simple_corner(a, b, c, radius, ring):
+    """Fillet walls at b with a compact radius. Does not wrap a bulge around the original vertex."""
+    if radius < 0.04:
+        return [b]
+    t1 = _vunit(_vsub(b, a))
+    t2 = _vunit(_vsub(c, b))
+    turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
+    if abs(turn) < 0.18:
+        return [b]
+    d1 = _vdist(a, b)
+    d2 = _vdist(b, c)
+    if d1 < 0.05 or d2 < 0.05:
+        return [b]
+
+    # Hairpin: cap with a semicircle that fits between the two walls — no extra bulb.
+    if abs(turn) > 2.05:
+        p0 = (b[0] - t1[0] * min(radius, d1 * 0.35), b[1] - t1[1] * min(radius, d1 * 0.35))
+        p1 = (b[0] + t2[0] * min(radius, d2 * 0.35), b[1] + t2[1] * min(radius, d2 * 0.35))
+        mid = ((p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5)
+        fit_r = max(_vdist(p0, p1) * 0.5, 0.08)
+        return [p0] + _arc_points(mid, p0, p1, fit_r, ring) + [p1]
+
+    half = abs(turn) * 0.5
+    tan_h = math.tan(half)
+    if tan_h < 1e-6:
+        return [b]
+    # Limit trim so an acute corner cannot balloon past a simple radius.
+    trim = min(radius * tan_h, radius * 1.1, d1 * 0.42, d2 * 0.42)
+    if trim < 0.04:
+        return [b]
+    r_used = trim / tan_h
+    p0 = (b[0] - t1[0] * trim, b[1] - t1[1] * trim)
+    p1 = (b[0] + t2[0] * trim, b[1] + t2[1] * trim)
+    left = (-t1[1], t1[0])
+    outward = (-left[0], -left[1]) if turn > 0 else left
+    center = (p0[0] + outward[0] * r_used, p0[1] + outward[1] * r_used)
+    if _point_in_ring(center, ring):
+        outward = (-outward[0], -outward[1])
+        center = (p0[0] + outward[0] * r_used, p0[1] + outward[1] * r_used)
+    return [p0] + _arc_points(center, p0, p1, r_used, ring) + [p1]
+
+
+def _fillet_offset_ring(points, radii, ring):
+    n = len(points)
+    if n < 3:
+        return points
+    out = []
+    for i in range(n):
+        a = points[(i - 1 + n) % n]
+        b = points[i]
+        c = points[(i + 1) % n]
+        out.extend(_simple_corner(a, b, c, radii[i], ring))
+    return _clean_ring(out, 0.02)
+
+
 def _prepare_ring(points):
     ring = _cap_ring(_ensure_ccw(_clean_ring(points)), MAX_SAMPLES)
     if len(ring) < 3:
@@ -346,25 +476,20 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
     sigma = max(1.2, (min_width * 0.55) / spacing)
     deltas = _smooth_closed_values(raw, sigma)
     pinches = _thin_runs([d > 0.04 for d in deltas])
-    moved = []
-    n = len(samples)
-    for i in range(n):
-        prev = samples[(i - 1 + n) % n]
-        curr = samples[i]
-        nxt = samples[(i + 1) % n]
-        t1 = _vunit(_vsub(curr["point"], prev["point"]))
-        t2 = _vunit(_vsub(nxt["point"], curr["point"]))
-        turn = math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
-        delta = deltas[i]
-        p_off = _offset_point(curr, delta, ring)
-        if round_corners and abs(turn) > 0.35 and delta > 0.05 and moved:
-            from_pt = _offset_point({"point": curr["point"], "inward": prev["inward"]}, delta, ring)
-            to_pt = _offset_point(curr, delta, ring)
-            if _vdist(from_pt, to_pt) > 0.08:
-                moved.append(from_pt)
-                moved.extend(_exterior_arc(curr["point"], from_pt, to_pt, delta, ring))
-        moved.append(p_off)
-    cleaned = _clean_ring(moved, 0.02)
+    moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
+    cleaned = _remove_loops(_clean_ring(moved, 0.02))
+    n = len(cleaned)
+    if n >= 3:
+        radii = []
+        for i in range(n):
+            # Match each corner to nearby sample delta; never use a fat vertex-centered cap.
+            nearest = min(
+                range(len(samples)),
+                key=lambda k: _vdist(cleaned[i], samples[k]["point"]),
+            )
+            radii.append(max(deltas[nearest], 0.0))
+        cleaned = _fillet_offset_ring(cleaned, radii, ring)
+        cleaned = _remove_loops(cleaned)
     return (cleaned if len(cleaned) >= 3 else ring, pinches)
 
 
@@ -629,36 +754,47 @@ def _samples_from_curve(curve, plane, ring, count):
     return samples
 
 
+def _curve_self_intersects(curve):
+    try:
+        events = rg.Intersect.Intersection.CurveSelf(curve, max(_tol(), 0.02))
+        return events is not None and events.Count > 0
+    except Exception:
+        return False
+
+
 def _interpolated_closed(plane, ring):
-    """Degree-3 periodic NURBS through the offset points — not a polyline."""
+    """Degree-3 NURBS through the offset points. Reject a looped interpolation."""
     if len(ring) < 4:
         return _polyline_curve(plane, ring)
     pts = [_from_xy(plane, p) for p in ring]
+    candidates = []
     styles = []
     try:
+        styles.append(rg.CurveKnotStyle.Chord)
         styles.append(rg.CurveKnotStyle.ChordPeriodic)
-        styles.append(rg.CurveKnotStyle.UniformPeriodic)
     except Exception:
         pass
     for style in styles:
         try:
             crv = rg.Curve.CreateInterpolatedCurve(pts, 3, style)
             if crv is not None and crv.IsValid:
-                if not crv.IsClosed:
-                    try:
-                        crv.MakeClosed(_tol() * 4)
-                    except Exception:
-                        pass
-                return crv
+                candidates.append(crv)
         except Exception:
             pass
     try:
-        closed_pts = list(pts) + [pts[0]]
-        crv = rg.Curve.CreateInterpolatedCurve(closed_pts, 3)
+        crv = rg.Curve.CreateInterpolatedCurve(list(pts) + [pts[0]], 3)
         if crv is not None and crv.IsValid:
-            return crv
+            candidates.append(crv)
     except Exception:
         pass
+    for crv in candidates:
+        if not crv.IsClosed:
+            try:
+                crv.MakeClosed(_tol() * 4)
+            except Exception:
+                pass
+        if crv.IsValid and not _curve_self_intersects(crv):
+            return crv
     return _polyline_curve(plane, ring)
 
 
@@ -1020,6 +1156,31 @@ def _self_test():
     assert_true(pinches > 0, "tiny closed slot should widen locally")
     assert_true(max(ys) - min(ys) > 5.2, "tiny slot should reach min width")
     assert_true(max(xs) - min(xs) < 12.0, "tiny slot should not become a stadium ribbon")
+
+    hairpin = []
+    for y in range(0, 41):
+        hairpin.append((0.0, float(y)))
+    for i in range(1, 17):
+        a = math.pi * 0.5 - i * math.pi / 16.0
+        hairpin.append((0.5 + 0.5 * math.cos(a), 40.0 + 0.5 * math.sin(a)))
+    for y in range(40, -1, -1):
+        hairpin.append((1.0, float(y)))
+    ring, samples, spacing = _prepare_ring(hairpin)
+    moved, pinches = _apply_min_width(ring, samples, spacing, 6.0, round_corners=False)
+    ys = [p[1] for p in moved]
+    assert_true(pinches > 0, "hairpin tip should be under min width")
+    assert_true(not _polyline_self_intersects(moved), "hairpin tip must not loop")
+    assert_true(max(ys) > 42.0, "hairpin tip should grow to a round cap, maxY={0}".format(max(ys)))
+
+    # 90° corner of a 3 mm band grown to 6 mm: simple radius, not a bulb.
+    elbow = [
+        (0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (37.0, 40.0),
+        (37.0, 3.0), (0.0, 3.0),
+    ]
+    moved, pinches = ensure_min_width_ring(elbow, 6.0)
+    xs = [p[0] for p in moved]
+    assert_true(pinches > 0, "thin elbow should widen")
+    assert_true(max(xs) < 44.5, "elbow corner should be a simple radius, not a bulge (maxX={0})".format(max(xs)))
 
     print("PlasmaKerf math tests passed")
 
