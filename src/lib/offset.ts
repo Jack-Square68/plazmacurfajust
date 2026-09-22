@@ -220,7 +220,7 @@ function exteriorArc(center: Point, from: Point, to: Point, radius: number, ring
   const midA = a0 + da / 2;
   const mid = { x: center.x + Math.cos(midA) * radius, y: center.y + Math.sin(midA) * radius };
   if (pointInPolygon(mid, ring)) da = da > 0 ? da - Math.PI * 2 : da + Math.PI * 2;
-  const steps = Math.max(4, Math.ceil((Math.abs(da) * radius) / 0.16));
+  const steps = Math.max(6, Math.ceil((Math.abs(da) * radius) / 0.12));
   const pts: Point[] = [];
   for (let i = 1; i < steps; i++) {
     const a = a0 + (da * i) / steps;
@@ -282,7 +282,7 @@ export function ensureMinWidth(
     const delta = deltas[i];
     const pOff = offsetPoint(curr, delta, ring);
 
-    const isCorner = Math.abs(turn) > 0.4 && delta > 0.05 && curr.edge !== prev.edge;
+    const isCorner = Math.abs(turn) > 0.35 && delta > 0.05;
     if (isCorner && moved.length) {
       const from = offsetPoint({ ...curr, inward: prev.inward }, delta, ring);
       const to = offsetPoint(curr, delta, ring);
