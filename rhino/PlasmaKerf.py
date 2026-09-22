@@ -434,6 +434,57 @@ def _fillet_offset_ring(points, radii, ring):
     return _clean_ring(out, 0.02)
 
 
+def _turn_at(a, b, c):
+    t1 = _vunit(_vsub(b, a))
+    t2 = _vunit(_vsub(c, b))
+    return math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
+
+
+def _round_short_ends(points, ring, min_width):
+    """Turn a blunt bar-end (two corners + short cap) into one semicircle."""
+    n = len(points)
+    if n < 8 or min_width <= 0:
+        return points
+    used = [False] * n
+    out = []
+    i = 0
+    while i < n:
+        if used[i]:
+            i += 1
+            continue
+        a = points[(i - 1 + n) % n]
+        b = points[i]
+        c = points[(i + 1) % n]
+        d = points[(i + 2) % n]
+        edge = _vdist(b, c)
+        prev_len = _vdist(a, b)
+        next_len = _vdist(c, d)
+        tb = _turn_at(a, b, c)
+        tc = _turn_at(b, c, d)
+        blunt = (
+            min_width * 0.3 < edge < min_width * 1.4
+            and prev_len > max(edge * 1.5, min_width * 0.8)
+            and next_len > max(edge * 1.5, min_width * 0.8)
+            and abs(tb) > 0.65
+            and abs(tc) > 0.65
+            and tb * tc > 0
+        )
+        if blunt and not used[(i + 1) % n]:
+            mid = ((b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5)
+            radius = max(edge * 0.5, 0.08)
+            out.append(b)
+            out.extend(_arc_points(mid, b, c, radius, ring))
+            out.append(c)
+            used[i] = True
+            used[(i + 1) % n] = True
+            i += 2
+            continue
+        out.append(b)
+        used[i] = True
+        i += 1
+    return _clean_ring(out, 0.02) if len(out) >= 3 else points
+
+
 def _prepare_ring(points):
     ring = _cap_ring(_ensure_ccw(_clean_ring(points)), MAX_SAMPLES)
     if len(ring) < 3:
@@ -489,6 +540,7 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
             )
             radii.append(max(deltas[nearest], 0.0))
         cleaned = _fillet_offset_ring(cleaned, radii, ring)
+        cleaned = _round_short_ends(cleaned, ring, min_width)
         cleaned = _remove_loops(cleaned)
     return (cleaned if len(cleaned) >= 3 else ring, pinches)
 
@@ -1148,6 +1200,10 @@ def _self_test():
     assert_true(pinches > 0, "thin slot should pinch")
     assert_true(5.4 < height < 7.2, "thin slot height should be ~6, got {0}".format(height))
     assert_true(max(xs) - min(xs) > 79.0, "thin slot should keep its length")
+    assert_true(
+        max(xs) - min(xs) > 81.5,
+        "thin slot ends should be a single radius, not a flat bar ({0})".format(max(xs) - min(xs)),
+    )
 
     tiny = [(0.0, 0.0), (5.0, 0.0), (5.0, 1.0), (0.0, 1.0)]
     moved, pinches = ensure_min_width_ring(tiny, 6.0)
