@@ -113,7 +113,7 @@ export const PRESET_HINTS: Record<string, string> = {
   "Dogleg slot": "Inside corners pinch; round joins keep the plasma path machinable.",
   "J-hook slot": "Works on polylines with arcs, not just straight segments.",
   "Tapered koru":
-    "Like the scroll work: the wide belly stays, the sharp tip rounds out to min width and the curve stays smooth.",
+    "Smooth offset of the original scroll: the wide belly stays on the red curve, the thin tip is a parallel offset out to min width.",
   "Pinched opening":
     "Only the 3 mm neck is under min width — the wide bulbs stay put instead of offsetting the whole loop.",
   "Square hole": "Switch mode to Hole so the torch sits inside by half the kerf.",

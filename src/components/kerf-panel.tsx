@@ -73,7 +73,7 @@ export function KerfPanel({
         </ToggleGroup>
         <p className="text-xs text-muted-foreground">
           {params.mode === "slot" &&
-            "Open centerline: thicken the whole path. Closed opening: only thin tapers grow — wide curves stay, tips round off smoothly."}
+            "Open centerline: thicken the whole path. Closed opening: a smooth parallel offset of the original, only where it is under the minimum."}
           {params.mode === "part" &&
             "Keep the red profile as the finished part. Torch path sits outside by kerf/2."}
           {params.mode === "hole" &&

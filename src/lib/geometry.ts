@@ -299,3 +299,22 @@ export function smoothPolyline(points: Point[], closed: boolean, passes = 2): Po
   return curr;
 }
 
+export function smoothClosedValues(values: number[], sigma: number): number[] {
+  if (values.length === 0 || sigma < 0.35) return values;
+  const radius = Math.max(1, Math.ceil(sigma * 3));
+  const kernel: number[] = [];
+  let sum = 0;
+  for (let i = -radius; i <= radius; i++) {
+    const k = Math.exp(-(i * i) / (2 * sigma * sigma));
+    kernel.push(k);
+    sum += k;
+  }
+  return values.map((_, i) => {
+    let acc = 0;
+    for (let j = -radius; j <= radius; j++) {
+      acc += values[(i + j + values.length) % values.length] * kernel[j + radius];
+    }
+    return acc / sum;
+  });
+}
+

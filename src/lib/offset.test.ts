@@ -1,4 +1,4 @@
-import { boundsOf, dist } from "./geometry";
+import { boundsOf, dist, distToPolyline } from "./geometry";
 import { compensateCurve, ensureMinWidth } from "./offset";
 import { createDemoCurves } from "./presets";
 import { DEFAULT_PARAMS, type Point, type Polyline } from "./types";
@@ -149,7 +149,11 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   assert(tipSpan > minWidth * 0.7, `rounded tip should be near min width, got ${tipSpan}`);
 
   const sharp = maxTurn(outline);
-  assert(sharp < 2.6, `koru outline should stay smooth (max turn ${sharp.toFixed(2)} rad)`);
+  assert(sharp < 1.2, `koru outline should stay a smooth offset (max turn ${sharp.toFixed(2)} rad)`);
+
+  const wide = koruPts.reduce((best, p) => (p.x > best.x ? p : best), koruPts[0]);
+  const keep = distToPolyline(wide, { id: "o", name: "o", points: outline, closed: true });
+  assert(keep < 0.6, `wide koru belly should stay on the original curve, drift=${keep}`);
 }
 
 console.log("offset tests passed");

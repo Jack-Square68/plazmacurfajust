@@ -347,55 +347,65 @@ def _union_closed(curves):
     return usable
 
 
-def _smooth_points(pts, passes=3):
-    if len(pts) < 3:
-        return pts
-    curr = list(pts)
-    for _ in range(passes):
-        nxt = [curr[0]]
-        for i in range(1, len(curr) - 1):
-            a = curr[i - 1]
+def _fair_closed_curve(pts, plane):
+    cleaned = []
+    for pt in pts:
+        if not cleaned or cleaned[-1].DistanceTo(pt) > 0.03:
+            cleaned.append(pt)
+    if len(cleaned) > 2 and cleaned[0].DistanceTo(cleaned[-1]) <= 0.03:
+        cleaned.pop()
+    if len(cleaned) < 3:
+        return None
+    curr = list(cleaned)
+    for _ in range(2):
+        nxt = []
+        n = len(curr)
+        for i in range(n):
+            a = curr[(i - 1) % n]
             b = curr[i]
-            c = curr[i + 1]
+            c = curr[(i + 1) % n]
             nxt.append(rg.Point3d(
                 (a.X + b.X * 2.0 + c.X) / 4.0,
                 (a.Y + b.Y * 2.0 + c.Y) / 4.0,
                 (a.Z + b.Z * 2.0 + c.Z) / 4.0,
             ))
-        nxt.append(curr[-1])
         curr = nxt
-    return curr
-
-
-def _fair_centerline(pts, plane):
-    cleaned = []
-    for pt in pts:
-        if not cleaned or cleaned[-1].DistanceTo(pt) > 0.04:
-            cleaned.append(pt)
-    if not cleaned:
-        return None
-    cleaned = _smooth_points(cleaned, 3)
-    if len(cleaned) == 1:
-        return rg.Circle(plane, cleaned[0], _tol() * 2).ToNurbsCurve()
-    if len(cleaned) < 4:
-        return rg.PolylineCurve(cleaned)
+    closed_pts = list(curr) + [curr[0]]
     try:
-        fair = rg.Curve.CreateInterpolatedCurve(cleaned, 3)
+        fair = rg.Curve.CreateInterpolatedCurve(closed_pts, 3)
         if fair is not None and fair.IsValid:
             return fair
     except Exception:
         pass
-    return rg.PolylineCurve(cleaned)
+    try:
+        return rg.PolylineCurve(closed_pts)
+    except Exception:
+        return None
+
+
+def _smooth_closed_values(values, sigma):
+    if not values or sigma < 0.35:
+        return list(values)
+    radius = max(1, int(math.ceil(sigma * 3)))
+    kernel = []
+    total = 0.0
+    for i in range(-radius, radius + 1):
+        k = math.exp(-(i * i) / (2.0 * sigma * sigma))
+        kernel.append(k)
+        total += k
+    n = len(values)
+    out = []
+    for i in range(n):
+        acc = 0.0
+        for j in range(-radius, radius + 1):
+            acc += values[(i + j) % n] * kernel[j + radius]
+        out.append(acc / total)
+    return out
 
 
 def _ensure_min_width(curve, min_width, corners):
-    """Widen only corridors of a closed curve that are thinner than min_width.
-
-    Thin tapers become a smooth min-width capsule with round ends. Already-wide
-    walls stay on the original curve so koru / scroll work keeps its flow.
-    """
+    """Parallel-offset the original curve only where it is thinner than min_width."""
     plane = _curve_plane(curve)
-    radius = min_width * 0.5
     try:
         length = curve.GetLength()
     except Exception:
@@ -403,8 +413,8 @@ def _ensure_min_width(curve, min_width, corners):
     if length < _tol() * 4:
         return [curve.DuplicateCurve()], 0, []
 
-    spacing = min(0.55, max(0.22, radius / 8.0))
-    steps = max(48, int(math.ceil(length / spacing)))
+    spacing = min(0.4, max(0.16, min_width / 24.0))
+    steps = max(64, int(math.ceil(length / spacing)))
     domain = curve.Domain
     samples = []
     for i in range(steps):
@@ -413,57 +423,71 @@ def _ensure_min_width(curve, min_width, corners):
         )
         pt = curve.PointAt(t)
         inward = _inward_at(curve, t, plane)
+        if inward is None:
+            continue
         width = _ray_width(curve, pt, inward)
         inside = _inside_clearance(curve, pt, t, plane)
         if width is None and inside is None:
-            continue
-        if width is None:
+            width = min_width
+        elif width is None:
             width = inside
         elif inside is not None:
             width = min(width, inside)
         samples.append((pt, inward, width, t))
 
-    thin = [s[2] < min_width - 1e-4 for s in samples]
-    if not any(thin):
+    raw = []
+    for _pt, _inward, width, _t in samples:
+        if width is None:
+            raw.append(0.0)
+        else:
+            raw.append(max(0.0, (min_width - width) * 0.5))
+    if not any(d > 1e-4 for d in raw):
         return [curve.DuplicateCurve()], 0, []
 
-    runs = []
-    current = []
-    for i, sample in enumerate(samples):
-        if thin[i]:
-            current.append(sample)
-        elif current:
-            runs.append(current)
-            current = []
-    if current:
-        runs.append(current)
-    if len(runs) >= 2 and thin[0] and thin[-1]:
-        last = runs.pop()
-        first = runs.pop(0)
-        runs.append(last + first)
+    sigma = max(1.2, (min_width * 0.55) / spacing)
+    deltas = _smooth_closed_values(raw, sigma)
+    pinches = 0
+    in_run = False
+    for d in deltas:
+        thin = d > 0.04
+        if thin and not in_run:
+            pinches += 1
+            in_run = True
+        elif not thin:
+            in_run = False
+    if deltas and deltas[0] > 0.04 and deltas[-1] > 0.04 and pinches >= 2:
+        pinches -= 1
 
-    extras = []
-    centerlines = []
-    for run in runs:
-        pts = []
-        for pt, inward, width, _t in run:
-            mid = pt + inward * (width * 0.5)
-            pts.append(mid)
-        if not pts:
+    moved = []
+    n = len(samples)
+    for i in range(n):
+        pt, inward, _width, _t = samples[i]
+        delta = deltas[i]
+        outward = rg.Vector3d(-inward.X, -inward.Y, -inward.Z)
+        if delta <= 1e-6:
+            moved.append(pt)
             continue
-        if len(pts) == 1 or pts[0].DistanceTo(pts[-1]) < 0.08:
-            circ = rg.Circle(plane, pts[0], radius)
-            extras.append(circ.ToNurbsCurve())
+        probe = pt + outward * min(0.2, delta)
+        try:
+            contain = curve.Contains(probe, plane, _tol())
+        except Exception:
+            contain = None
+        if contain == rg.PointContainment.Inside:
+            outward.Reverse()
+        if not outward.Unitize():
+            moved.append(pt)
             continue
-        line = _fair_centerline(pts, plane)
-        if line is None:
-            continue
-        centerlines.append(line.DuplicateCurve())
-        capsule = _thicken_open(line, radius, "Round", "Round")
-        extras.extend(capsule)
+        moved.append(pt + outward * delta)
 
-    outline = _union_closed([curve.DuplicateCurve()] + extras)
-    return outline, len(runs), centerlines
+    outline_curve = _fair_closed_curve(moved, plane)
+    if outline_curve is None:
+        return [curve.DuplicateCurve()], pinches, []
+    if not outline_curve.IsClosed:
+        try:
+            outline_curve.MakeClosed(_tol() * 4)
+        except Exception:
+            pass
+    return [outline_curve], pinches, []
 
 
 def _inset_closed(curves, distance, corners):

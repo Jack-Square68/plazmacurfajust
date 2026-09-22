@@ -4,6 +4,7 @@ import {
   add,
   cleanPoints,
   closestOnSegment,
+  cross,
   dist,
   ensureCcw,
   midpoint,
@@ -12,7 +13,8 @@ import {
   raySegmentT,
   rotateLeft,
   signedArea,
-  smoothPolyline,
+  smoothClosedValues,
+  sub,
   unit,
 } from "./geometry";
 import type { CapStyle, Compensated, JoinStyle, KerfParams, Point, Polyline } from "./types";
@@ -128,9 +130,8 @@ export function unionPaths(polygons: Point[][]): Point[][] {
     .map((pts) => ensureCcw(cleanPoints(pts, true)))
     .filter((pts) => pts.length >= 3);
   if (closed.length === 0) return [];
-  if (closed.length === 1) return closed;
 
-  const clipper = new ClipperLib.Clipper();
+  const clipper = new ClipperLib.Clipper(2);
   clipper.AddPaths(
     closed.map(toPath),
     ClipperLib.PolyType.ptSubject,
@@ -143,20 +144,8 @@ export function unionPaths(polygons: Point[][]): Point[][] {
     ClipperLib.PolyFillType.pftNonZero,
     ClipperLib.PolyFillType.pftNonZero,
   );
-  return solution.map(fromPath).filter((p) => p.length >= 3);
-}
-
-function circlePath(center: Point, radius: number): Point[] {
-  const n = Math.min(64, Math.max(24, Math.ceil((Math.PI * 2 * radius) / 0.18)));
-  const pts: Point[] = [];
-  for (let i = 0; i < n; i++) {
-    const a = (i / n) * Math.PI * 2;
-    pts.push({
-      x: center.x + Math.cos(a) * radius,
-      y: center.y + Math.sin(a) * radius,
-    });
-  }
-  return pts;
+  const out = solution.map(fromPath).filter((p) => p.length >= 3);
+  return out.length ? out : closed;
 }
 
 type WidthSample = {
@@ -206,56 +195,53 @@ function localWidth(origin: Point, inward: Point, ring: Point[], skipEdge: numbe
   return best;
 }
 
-function thinRuns(samples: WidthSample[], minWidth: number): WidthSample[][] {
-  const thin = samples.map((s) => Number.isFinite(s.width) && s.width < minWidth - 1e-4);
-  if (!thin.some(Boolean)) return [];
-
-  const runs: WidthSample[][] = [];
-  let current: WidthSample[] = [];
-  for (let i = 0; i < samples.length; i++) {
-    if (thin[i]) {
-      current.push(samples[i]);
-    } else if (current.length) {
-      runs.push(current);
-      current = [];
+function thinRuns(flags: boolean[]): number {
+  if (!flags.some(Boolean)) return 0;
+  let runs = 0;
+  let inRun = false;
+  for (const flag of flags) {
+    if (flag && !inRun) {
+      runs += 1;
+      inRun = true;
+    } else if (!flag) {
+      inRun = false;
     }
   }
-  if (current.length) runs.push(current);
-
-  if (runs.length >= 2 && thin[0] && thin[thin.length - 1]) {
-    const last = runs.pop();
-    const first = runs.shift();
-    if (last && first) runs.push([...last, ...first]);
-  }
+  if (flags[0] && flags[flags.length - 1] && runs >= 2) runs -= 1;
   return runs;
 }
 
-function centerlineOf(run: WidthSample[]): Point[] {
-  const raw = run.map((s) => add(s.point, mul(s.inward, s.width * 0.5)));
-  const cleaned = cleanPoints(raw, false, 0.04);
-  return smoothPolyline(cleaned, false, 3);
+function exteriorArc(center: Point, from: Point, to: Point, radius: number, ring: Point[]): Point[] {
+  const a0 = Math.atan2(from.y - center.y, from.x - center.x);
+  const a1 = Math.atan2(to.y - center.y, to.x - center.x);
+  let da = a1 - a0;
+  while (da <= -Math.PI) da += Math.PI * 2;
+  while (da > Math.PI) da -= Math.PI * 2;
+  const midA = a0 + da / 2;
+  const mid = { x: center.x + Math.cos(midA) * radius, y: center.y + Math.sin(midA) * radius };
+  if (pointInPolygon(mid, ring)) da = da > 0 ? da - Math.PI * 2 : da + Math.PI * 2;
+  const steps = Math.max(4, Math.ceil((Math.abs(da) * radius) / 0.16));
+  const pts: Point[] = [];
+  for (let i = 1; i < steps; i++) {
+    const a = a0 + (da * i) / steps;
+    pts.push({ x: center.x + Math.cos(a) * radius, y: center.y + Math.sin(a) * radius });
+  }
+  return pts;
 }
 
-function fattenRun(run: WidthSample[], radius: number): Point[][] {
-  const line = centerlineOf(run);
-  if (line.length === 0) return [];
-  if (line.length === 1 || dist(line[0], line[line.length - 1]) < 0.08) {
-    return [circlePath(line[0], radius)];
-  }
-  const capsule = offsetPath(line, radius, {
-    closed: false,
-    closedAsLine: false,
-    join: "round",
-    cap: "round",
-  });
-  if (capsule.length) return capsule;
-  return [circlePath(line[Math.floor(line.length / 2)], radius)];
+function offsetPoint(sample: WidthSample, delta: number, ring: Point[]): Point {
+  if (delta <= 1e-6) return sample.point;
+  let outward = mul(sample.inward, -1);
+  const probe = add(sample.point, mul(outward, Math.min(0.2, delta)));
+  if (pointInPolygon(probe, ring)) outward = mul(outward, -1);
+  return add(sample.point, mul(outward, delta));
 }
 
 /**
- * Grow only the stretches of a closed opening that are narrower than
- * `minWidth`. Wide flowing walls stay as drawn; thin tapers get a
- * smooth min-width capsule with round ends (like a koru tip).
+ * Parallel-offset the original closed curve, but only where local width is
+ * under minWidth. Wide walls stay on the input; thin stretches move out
+ * along the original normals with a smoothed distance so the result is a
+ * fair offset of the same curve, not a new capsule.
  */
 export function ensureMinWidth(
   points: Point[],
@@ -267,24 +253,57 @@ export function ensureMinWidth(
     return { outline: ring.length >= 3 ? [ring] : [], pinches: 0, centerlines: [] };
   }
 
-  const radius = minWidth / 2;
-  const spacing = Math.min(0.55, Math.max(0.22, radius / 8));
+  const spacing = Math.min(0.4, Math.max(0.16, minWidth / 24));
   const samples: WidthSample[] = sampleBoundary(ring, spacing).map((s) => ({
     ...s,
     width: localWidth(s.point, s.inward, ring, s.edge),
   }));
-  const runs = thinRuns(samples, minWidth);
-  const centerlines = runs.map(centerlineOf).filter((l) => l.length > 0);
+  if (samples.length < 3) return { outline: [ring], pinches: 0, centerlines: [] };
 
-  if (runs.length === 0) {
+  const rawDelta = samples.map((s) =>
+    Number.isFinite(s.width) ? Math.max(0, (minWidth - s.width) / 2) : 0,
+  );
+  if (!rawDelta.some((d) => d > 1e-4)) {
     return { outline: [ring], pinches: 0, centerlines: [] };
   }
 
-  const extras = runs.flatMap((run) => fattenRun(run, radius));
-  const outline = unionPaths([ring, ...extras]);
+  const sigma = Math.max(1.2, (minWidth * 0.55) / spacing);
+  const deltas = smoothClosedValues(rawDelta, sigma);
+  const pinches = thinRuns(deltas.map((d) => d > 0.04));
+
+  const moved: Point[] = [];
+  for (let i = 0; i < samples.length; i++) {
+    const prev = samples[(i - 1 + samples.length) % samples.length];
+    const curr = samples[i];
+    const next = samples[(i + 1) % samples.length];
+    const t1 = unit(sub(curr.point, prev.point));
+    const t2 = unit(sub(next.point, curr.point));
+    const turn = Math.atan2(cross(t1, t2), t1.x * t2.x + t1.y * t2.y);
+    const delta = deltas[i];
+    const pOff = offsetPoint(curr, delta, ring);
+
+    const isCorner = Math.abs(turn) > 0.4 && delta > 0.05 && curr.edge !== prev.edge;
+    if (isCorner && moved.length) {
+      const from = offsetPoint({ ...curr, inward: prev.inward }, delta, ring);
+      const to = offsetPoint(curr, delta, ring);
+      if (dist(from, to) > 0.08) {
+        moved.push(from);
+        moved.push(...exteriorArc(curr.point, from, to, delta, ring));
+      }
+    }
+    moved.push(pOff);
+  }
+
+  const outline = unionPaths([cleanPoints(moved, true, 0.02)]);
+  const centerlines: Point[][] = [];
+  const thin = samples
+    .map((s, i) => (deltas[i] > 0.04 ? add(s.point, mul(s.inward, s.width * 0.5)) : null))
+    .filter((p): p is Point => p !== null);
+  if (thin.length >= 2) centerlines.push(cleanPoints(thin, false, 0.08));
+
   return {
     outline: outline.length ? outline : [ring],
-    pinches: runs.length,
+    pinches,
     centerlines,
   };
 }
