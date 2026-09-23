@@ -9,10 +9,10 @@ Rhino 7 / 8
 -----------
 Closed openings are sampled once to a polyline (capped) for width only.
 The baked outline is the original NURBS, offset as spans, with the same
-MinWidth/2 G1 arc on every tip — not a 1200-point interpolant. Slot ends
-get a MinWidth/2 semicircle around the original tip. Pointed corners of a
-wide opening stay as drawn. Rhino is not asked to CurveCurve / GetLength /
-Contains on every sample, so a koru no longer locks the UI.
+MinWidth/2 G2 fair blend on every tip — not a 1200-point interpolant.
+Slot ends get a MinWidth/2 semicircle around the original tip. Pointed
+corners of a wide opening stay as drawn. Rhino is not asked to CurveCurve
+/ GetLength / Contains on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -752,6 +752,25 @@ def _fillet_grown_corner(a, b, c, grow1, grow2, radius, ring):
     return [p0] + _arc_points(center, p0, p1, r_used, ring) + [p1]
 
 
+def _fair_grown_corner(a, b, c, grow1, grow2, radius, ring):
+    """Offset the original walls, then G2-blend the miter — one fair tip."""
+    if radius < 0.04:
+        return [b]
+    out1 = _wall_outward(a, b, ring)
+    out2 = _wall_outward(b, c, ring)
+    g1a = _vadd(a, _vmul(out1, grow1))
+    g1b = _vadd(b, _vmul(out1, grow1))
+    g2b = _vadd(b, _vmul(out2, grow2))
+    g2c = _vadd(c, _vmul(out2, grow2))
+    corner = _line_intersect_unbounded(g1a, g1b, g2b, g2c)
+    if corner is None:
+        return _fair_tip_blend(a, b, c, radius, ring)
+    chain = _fair_tip_blend(g1a, corner, g2c, radius, ring)
+    if len(chain) >= 4:
+        return chain
+    return _fillet_grown_corner(a, b, c, grow1, grow2, radius, ring)
+
+
 def _end_cap_chain(center, p0, p1, radius, ring):
     """Semicircle of `radius` around the original square / pointed end."""
     chord = _vunit(_vsub(p1, p0))
@@ -927,8 +946,181 @@ def _original_features(feature_ring, samples, grow, min_width):
     return features
 
 
-def _constant_radius_fillet(a, b, c, radius, ring):
-    """G1 fillet of exactly `radius` — same on every tip, tangent to both walls."""
+def _bezier_point(ctrl, t):
+    """de Casteljau evaluation of a 2D Bézier."""
+    pts = list(ctrl)
+    u = 1.0 - t
+    n = len(pts) - 1
+    for _ in range(n):
+        nxt = []
+        for i in range(len(pts) - 1):
+            nxt.append((pts[i][0] * u + pts[i + 1][0] * t, pts[i][1] * u + pts[i + 1][1] * t))
+        pts = nxt
+    return pts[0]
+
+
+def _bezier_derivative(ctrl, t):
+    n = len(ctrl) - 1
+    if n < 1:
+        return (0.0, 0.0)
+    diffs = []
+    for i in range(n):
+        diffs.append(((ctrl[i + 1][0] - ctrl[i][0]) * n, (ctrl[i + 1][1] - ctrl[i][1]) * n))
+    return _bezier_point(diffs, t)
+
+
+def _sample_bezier(ctrl, spacing=0.12):
+    if len(ctrl) < 2:
+        return list(ctrl)
+    prev = ctrl[0]
+    acc = 0.0
+    probe = 24
+    for i in range(1, probe + 1):
+        p = _bezier_point(ctrl, i / float(probe))
+        acc += _vdist(prev, p)
+        prev = p
+    steps = max(10, int(math.ceil(acc / max(spacing, 0.04))))
+    return [_bezier_point(ctrl, i / float(steps)) for i in range(steps + 1)]
+
+
+def _g2_quintic_controls(p0, t0, k0, p1, t1, k1, alpha, beta):
+    """Hermite G2 quintic: matches position, tangent and curvature at both ends."""
+    t0 = _vunit(t0)
+    t1 = _vunit(t1)
+    if (t0[0] == 0.0 and t0[1] == 0.0) or (t1[0] == 0.0 and t1[1] == 0.0):
+        return None
+    n0 = (-t0[1], t0[0])
+    n1 = (-t1[1], t1[0])
+    a = max(alpha, 0.08)
+    b = max(beta, 0.08)
+    c1 = (p0[0] + (a / 5.0) * t0[0], p0[1] + (a / 5.0) * t0[1])
+    c2 = (
+        p0[0] + (2.0 * a / 5.0) * t0[0] + (a * a * k0 / 20.0) * n0[0],
+        p0[1] + (2.0 * a / 5.0) * t0[1] + (a * a * k0 / 20.0) * n0[1],
+    )
+    c4 = (p1[0] - (b / 5.0) * t1[0], p1[1] - (b / 5.0) * t1[1])
+    c3 = (
+        p1[0] - (2.0 * b / 5.0) * t1[0] + (b * b * k1 / 20.0) * n1[0],
+        p1[1] - (2.0 * b / 5.0) * t1[1] + (b * b * k1 / 20.0) * n1[1],
+    )
+    return [p0, c1, c2, c3, c4, p1]
+
+
+def _circular_fillet_mid(a, b, c, radius):
+    """Midpoint of the G1 circular fillet — target extent for the fair blend."""
+    t1 = _vunit(_vsub(b, a))
+    t2 = _vunit(_vsub(c, b))
+    if (t1[0] == 0.0 and t1[1] == 0.0) or (t2[0] == 0.0 and t2[1] == 0.0):
+        return None
+    turn = math.atan2(_vcross(t1, t2), _vdot(t1, t2))
+    if abs(turn) < 0.08:
+        return None
+    tan_h = math.tan(abs(turn) * 0.5)
+    if tan_h < 1e-8:
+        return None
+    trim = radius * tan_h
+    p0 = (b[0] - t1[0] * trim, b[1] - t1[1] * trim)
+    p1 = (b[0] + t2[0] * trim, b[1] + t2[1] * trim)
+    left = (-t1[1], t1[0])
+    inward = left if turn > 0.0 else (-left[0], -left[1])
+    center = (p0[0] + inward[0] * radius, p0[1] + inward[1] * radius)
+    mid_a = math.atan2(p0[1] - center[1], p0[0] - center[0])
+    mid_b = math.atan2(p1[1] - center[1], p1[0] - center[0])
+    da = mid_b - mid_a
+    while da <= -math.pi:
+        da += math.pi * 2.0
+    while da > math.pi:
+        da -= math.pi * 2.0
+    ang = mid_a + da * 0.5
+    return (center[0] + math.cos(ang) * radius, center[1] + math.sin(ang) * radius)
+
+
+def _fair_g2_controls(p0, t0, k0, p1, t1, k1, radius, corner):
+    """G2 quintic that eases out of both walls and reaches the min-width tip."""
+    t0 = _vunit(t0)
+    t1 = _vunit(t1)
+    if (t0[0] == 0.0 and t0[1] == 0.0) or (t1[0] == 0.0 and t1[1] == 0.0):
+        return None
+    target = None
+    if corner is not None:
+        target = _circular_fillet_mid(
+            (p0[0] - t0[0], p0[1] - t0[1]),
+            corner,
+            (p1[0] + t1[0], p1[1] + t1[1]),
+            radius,
+        )
+    if target is None:
+        target = ((p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5)
+    span = max(_vdist(p0, p1), radius * 2.0, 0.5)
+    lo = span * 0.35
+    hi = span * 3.6
+    best = None
+    best_d = 1e300
+    for _ in range(18):
+        mid = 0.5 * (lo + hi)
+        ctrl = _g2_quintic_controls(p0, t0, k0, p1, t1, k1, mid, mid)
+        if ctrl is None:
+            break
+        pt = _bezier_point(ctrl, 0.5)
+        d = _vdist(pt, target)
+        if d < best_d:
+            best_d = d
+            best = ctrl
+        toward = _vdot(_vsub(pt, p0), _vsub(target, p0))
+        past = _vdist(pt, p0) > _vdist(target, p0) and toward > 0.0
+        if past:
+            hi = mid
+        else:
+            lo = mid
+    return best
+
+
+def _polyline_kappa(points, i):
+    n = len(points)
+    if n < 3:
+        return 0.0
+    a = points[(i - 1 + n) % n]
+    b = points[i]
+    c = points[(i + 1) % n]
+    turn = _turn_at(a, b, c)
+    ds = 0.5 * (_vdist(a, b) + _vdist(b, c))
+    if ds < 1e-9:
+        return 0.0
+    return turn / ds
+
+
+def _path_tangent(points, i, sense):
+    n = len(points)
+    j = (i + sense + n) % n
+    t = _vunit(_vsub(points[j], points[i]))
+    if t[0] == 0.0 and t[1] == 0.0:
+        k = (i + 2 * sense + n) % n
+        t = _vunit(_vsub(points[k], points[i]))
+    return t
+
+
+def _circular_g1_chain(a, b, c, radius, ring):
+    t1 = _vunit(_vsub(b, a))
+    t2 = _vunit(_vsub(c, b))
+    if (t1[0] == 0.0 and t1[1] == 0.0) or (t2[0] == 0.0 and t2[1] == 0.0):
+        return [b]
+    turn = math.atan2(_vcross(t1, t2), _vdot(t1, t2))
+    if abs(turn) < 0.08:
+        return [b]
+    tan_h = math.tan(abs(turn) * 0.5)
+    if tan_h < 1e-8:
+        return [b]
+    trim = radius * tan_h
+    p0 = (b[0] - t1[0] * trim, b[1] - t1[1] * trim)
+    p1 = (b[0] + t2[0] * trim, b[1] + t2[1] * trim)
+    left = (-t1[1], t1[0])
+    inward = left if turn > 0.0 else (-left[0], -left[1])
+    center = (p0[0] + inward[0] * radius, p0[1] + inward[1] * radius)
+    return [p0] + _arc_points(center, p0, p1, radius, ring) + [p1]
+
+
+def _fair_tip_blend(a, b, c, radius, ring, k0=0.0, k1=0.0):
+    """G2 fair blend of about `radius` — same on every tip, eases out of both walls."""
     if radius < 0.04:
         return [b]
     t1 = _vunit(_vsub(b, a))
@@ -938,40 +1130,62 @@ def _constant_radius_fillet(a, b, c, radius, ring):
     turn = math.atan2(_vcross(t1, t2), _vdot(t1, t2))
     if abs(turn) < 0.08:
         return [b]
-    if abs(turn) > 2.4 or _vdot(t1, t2) < -0.90:
+    if _vdot(t1, t2) < -0.90:
         return _end_cap_chain(b, a, c, radius, ring)
     tan_h = math.tan(abs(turn) * 0.5)
     if tan_h < 1e-8:
         return [b]
-    trim = radius * tan_h
+    # Longer than a circular trim so curvature eases in from the walls.
+    trim = radius * tan_h * 1.65
     p0 = (b[0] - t1[0] * trim, b[1] - t1[1] * trim)
     p1 = (b[0] + t2[0] * trim, b[1] + t2[1] * trim)
-    left = (-t1[1], t1[0])
-    inward = left if turn > 0.0 else (-left[0], -left[1])
-    # Centre sits on the inside of the offset corner. Do not flip from the
-    # original ring: that centre often still lies in the old slot.
-    center = (p0[0] + inward[0] * radius, p0[1] + inward[1] * radius)
-    return [p0] + _arc_points(center, p0, p1, radius, ring) + [p1]
+    ctrl = _fair_g2_controls(p0, t1, k0, p1, t2, k1, radius, b)
+    if ctrl is None:
+        return _circular_g1_chain(a, b, c, radius, ring)
+    return _sample_bezier(ctrl)
+
+
+def _constant_radius_fillet(a, b, c, radius, ring):
+    """Same-radius tip: G2 fair blend (hairpin stays a semicircle)."""
+    return _fair_tip_blend(a, b, c, radius, ring)
 
 
 def _cap_all_tips_same(moved, tips, radius, ring):
-    """Replace every tip with the same tangent radius so they match and stay G1."""
+    """Replace every tip with the same G2 fair blend so they match and stay fair."""
     if len(moved) < 6 or not tips or radius < 0.04:
         return moved, []
     protected = []
-    walk = max(radius * 2.2, 3.0)
+    # Blend between points that already lie on the offset walls so the join stays G2.
+    walk = max(radius * 2.6, 7.0)
     for tip in tips:
         if tip is None:
             continue
         i, _ = _nearest_index(moved, tip)
         p_l, i_l = _walk_along(moved, i, -1, walk)
         p_r, i_r = _walk_along(moved, i, 1, walk)
-        p_ll, _ = _walk_along(moved, i_l, -1, max(radius, 1.0))
-        p_rr, _ = _walk_along(moved, i_r, 1, max(radius, 1.0))
-        corner = _line_intersect_unbounded(p_ll, p_l, p_r, p_rr)
+        t0 = _path_tangent(moved, i_l, 1)
+        t1 = _path_tangent(moved, i_r, 1)
+        k0 = _polyline_kappa(moved, i_l)
+        k1 = _polyline_kappa(moved, i_r)
+        corner = _line_intersect_unbounded(
+            p_l,
+            (p_l[0] + t0[0], p_l[1] + t0[1]),
+            p_r,
+            (p_r[0] - t1[0], p_r[1] - t1[1]),
+        )
         if corner is None:
             corner = moved[i]
-        chain = _constant_radius_fillet(p_ll, corner, p_rr, radius, ring)
+        ctrl = _fair_g2_controls(p_l, t0, k0, p_r, t1, k1, radius, corner)
+        if ctrl is None:
+            chain = _circular_g1_chain(
+                (p_l[0] - t0[0], p_l[1] - t0[1]),
+                corner,
+                (p_r[0] + t1[0], p_r[1] + t1[1]),
+                radius,
+                ring,
+            )
+        else:
+            chain = _sample_bezier(ctrl)
         if len(chain) < 2:
             continue
         nxt = _replace_span(moved, i_l, i_r, chain)
@@ -983,13 +1197,12 @@ def _cap_all_tips_same(moved, tips, radius, ring):
 
 
 def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, min_width):
-    """Same min-width-radius cap on every tip, tangent to the offset walls."""
+    """Same min-width G2 fair blend on every tip, easing out of the offset walls."""
     protected = []
     if len(moved) < 4 or min_width <= 0:
         return moved, protected
     radius = min_width * 0.5
     features = _original_features(feature_ring, samples, grow, min_width)
-    tips = []
     for feat in features:
         if feat["kind"] == "end":
             vertex = feat.get("center")
@@ -1000,10 +1213,17 @@ def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, 
                     moved = nxt
                     protected.extend(chain)
         else:
-            tips.append(feat.get("b") or feat.get("center"))
-    if tips:
-        moved, extra = _cap_all_tips_same(moved, tips, radius, interior_ring)
-        protected.extend(extra)
+            a = feat.get("a")
+            b = feat.get("b") or feat.get("center")
+            c = feat.get("c")
+            if a is None or b is None or c is None:
+                continue
+            chain = _fair_grown_corner(a, b, c, radius, radius, radius, interior_ring)
+            if len(chain) >= 2:
+                nxt = _splice_feature(moved, chain, b, radius)
+                if nxt is not moved and len(nxt) >= 3:
+                    moved = nxt
+                    protected.extend(chain)
     cleaned = _clean_ring(moved, 0.02) if len(moved) >= 3 else moved
     return cleaned, protected
 
@@ -1199,6 +1419,42 @@ def _compute_deltas(samples, spacing, min_width):
     return _distance_scaled_deltas(samples, raw, min_width)
 
 
+def _uniform_outward_offset(ring, distance, interior):
+    """Parallel of the original ring — keeps the same fairness as the input walls."""
+    n = len(ring)
+    if n < 3 or distance <= 1e-9:
+        return list(ring)
+    out = []
+    for i in range(n):
+        prev = ring[(i - 1 + n) % n]
+        nxt = ring[(i + 1) % n]
+        tangent = _vunit(_vsub(nxt, prev))
+        if tangent[0] == 0.0 and tangent[1] == 0.0:
+            tangent = _vunit(_vsub(nxt, ring[i]))
+        inward = _vleft(tangent)
+        probe = _vadd(ring[i], _vmul(inward, 0.25))
+        if not _point_in_ring(probe, interior):
+            inward = _vmul(inward, -1.0)
+        out.append(_vadd(ring[i], _vmul(inward, -distance)))
+    return _clean_ring(out, 0.02) if len(out) >= 3 else out
+
+
+def _rebuild_fair_opening(ring, features, min_width, interior):
+    """Parallel offset of the original, then the same G2 tip on every corner."""
+    radius = min_width * 0.5
+    offset = _uniform_outward_offset(ring, radius, interior)
+    if len(offset) < 6:
+        return None
+    tips = [f.get("b") or f.get("center") for f in features if f.get("kind") == "fillet"]
+    tips = [t for t in tips if t is not None]
+    if len(tips) < 2:
+        return None
+    moved, _ = _cap_all_tips_same(offset, tips, radius, interior)
+    if len(moved) < 3 or _polyline_self_intersects(moved):
+        return None
+    return moved
+
+
 def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
     if len(ring) < 3 or min_width <= 0:
         return (ring, 0)
@@ -1207,6 +1463,16 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
     deltas, pinches = _compute_deltas(samples, spacing, min_width)
     if pinches == 0:
         return (ring, 0)
+    raw = _raw_deltas(samples, min_width)
+    features = _original_features(ring, samples, deltas, min_width)
+    if (
+        _mostly_thin(raw)
+        and features
+        and all(f.get("kind") == "fillet" for f in features)
+    ):
+        rebuilt = _rebuild_fair_opening(ring, features, min_width, ring)
+        if rebuilt is not None:
+            return (rebuilt, pinches)
     moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
     cleaned = _remove_loops(_clean_ring(moved, 0.02))
     if len(cleaned) >= 3:
@@ -1803,45 +2069,126 @@ def _orient_span_loop(spans):
     return out
 
 
-def _fillet_arc_between(a, b, radius):
-    """True Arc of `radius` tangent to two offset walls. Never an interpolant."""
+def _length_parameter(curve, length):
+    try:
+        got = curve.LengthParameter(max(0.0, length))
+    except Exception:
+        return None
+    if isinstance(got, tuple):
+        if len(got) >= 2 and got[0]:
+            return got[1]
+        return None
+    return got
+
+
+def _nurbs_from_xy_controls(plane, cvs, degree=5):
+    if not cvs or len(cvs) < 2:
+        return None
+    deg = min(int(degree), len(cvs) - 1)
+    pts = [_from_xy(plane, p) for p in cvs]
+    try:
+        crv = rg.NurbsCurve.Create(False, deg, pts)
+        if crv is not None and crv.IsValid:
+            return crv
+    except Exception:
+        pass
+    return None
+
+
+def _fair_blend_between(a, b, radius, plane, ring):
+    """G2 fair blend between two offset walls. Few-CV NURBS, never an interpolant."""
     if a is None or b is None or radius < _tol():
         return None
-    pairs = [
-        (a.PointAtEnd, b.PointAtStart),
-        (a.PointAtEnd, b.PointAtEnd),
-        (a.PointAtStart, b.PointAtStart),
-        (a.PointAtStart, b.PointAtEnd),
-    ]
-    pa, pb = min(pairs, key=lambda p: p[0].DistanceTo(p[1]))
+    la = _span_length(a)
+    lb = _span_length(b)
+    if la < _tol() or lb < _tol():
+        return None
+    blend_len = min(max(radius * 2.8, 5.0), la * 0.38, lb * 0.38)
+    tA = _length_parameter(a, max(la - blend_len, la * 0.55))
+    tB = _length_parameter(b, min(blend_len, lb * 0.45))
+    if tA is None:
+        tA = a.Domain.Max
+    if tB is None:
+        tB = b.Domain.Min
+
+    continuity = None
     try:
-        result = rg.Curve.CreateFilletCurves(
-            a, pa, b, pb, radius, False, False, True, _tol(), 0.1
-        )
+        continuity = rg.BlendContinuity.Curvature
     except Exception:
-        result = None
-    for crv in _as_list(result):
-        if crv is not None and crv.IsValid and _span_length(crv) > _tol():
-            return crv
+        try:
+            continuity = rg.BlendContinuity.Tangency
+        except Exception:
+            continuity = None
+
+    candidates = []
+    if continuity is not None:
+        for rev_a, rev_b in ((False, False), (False, True), (True, False), (True, True)):
+            try:
+                crv = rg.Curve.CreateBlendCurve(
+                    a, tA, rev_a, continuity, b, tB, rev_b, continuity
+                )
+            except Exception:
+                crv = None
+            for piece in _as_list(crv):
+                if piece is not None and getattr(piece, "IsValid", True) and _span_length(piece) > _tol():
+                    candidates.append(piece)
+        try:
+            crv = rg.Curve.CreateBlendCurve(a, b, continuity)
+        except Exception:
+            crv = None
+        for piece in _as_list(crv):
+            if piece is not None and getattr(piece, "IsValid", True) and _span_length(piece) > _tol():
+                candidates.append(piece)
+
+    def _score(crv):
+        try:
+            mid = crv.PointAtNormalizedLength(0.5)
+        except Exception:
+            mid = crv.PointAt(0.5 * (crv.Domain.Min + crv.Domain.Max))
+        xy = _to_xy(plane, mid)
+        outside = 0.0 if _point_in_ring(xy, ring) else 1000.0
+        return outside + _span_length(crv)
+
+    if candidates:
+        return max(candidates, key=_score)
+
+    # Geometric quintic — 6 CVs, still a fair few-node NURBS.
     try:
-        ok_a, ta = a.ClosestPoint(pa)
-        ok_b, tb = b.ClosestPoint(pb)
-        if ok_a and ok_b:
-            arc = rg.Curve.CreateFillet(a, b, radius, ta, tb)
-            if arc is not None:
-                try:
-                    crv = rg.ArcCurve(arc)
-                except Exception:
-                    crv = arc
-                if crv is not None and getattr(crv, "IsValid", True):
-                    return crv
+        pa = _to_xy(plane, a.PointAt(tA))
+        pb = _to_xy(plane, b.PointAt(tB))
+        ta = a.TangentAt(tA)
+        tb = b.TangentAt(tB)
+        t0 = _vunit((ta * plane.XAxis, ta * plane.YAxis))
+        t1 = _vunit((tb * plane.XAxis, tb * plane.YAxis))
+        k0 = 0.0
+        k1 = 0.0
+        try:
+            k0 = a.CurvatureAt(tA).Length
+            k1 = b.CurvatureAt(tB).Length
+            # Signed by whether curvature points left of the tangent.
+            c0 = a.CurvatureAt(tA)
+            c1 = b.CurvatureAt(tB)
+            left0 = (-t0[1], t0[0])
+            left1 = (-t1[1], t1[0])
+            k0 = _vdot(left0, (c0 * plane.XAxis, c0 * plane.YAxis))
+            k1 = _vdot(left1, (c1 * plane.XAxis, c1 * plane.YAxis))
+        except Exception:
+            k0 = 0.0
+            k1 = 0.0
+        corner = _line_intersect_unbounded(
+            pa, (pa[0] + t0[0], pa[1] + t0[1]),
+            pb, (pb[0] - t1[0], pb[1] - t1[1]),
+        )
+        ctrl = _fair_g2_controls(pa, t0, k0, pb, t1, k1, radius, corner)
+        if ctrl:
+            return _nurbs_from_xy_controls(plane, ctrl, 5)
     except Exception:
         pass
     return None
 
 
 def _arc_from_chain(plane, chain, radius, ring):
-    """Build one ArcCurve through a 2D G1 chain (p0 + arc + p1)."""
+    """Build one ArcCurve through a 2D G1 chain (p0 + arc + p1). Slot ends only."""
     if not chain or len(chain) < 2:
         return None
     p0 = chain[0]
@@ -1859,21 +2206,8 @@ def _arc_from_chain(plane, chain, radius, ring):
 
 
 def _geometric_fillet_arc(a, b, radius, plane, ring):
-    pa = _to_xy(plane, a.PointAtEnd)
-    pb = _to_xy(plane, b.PointAtStart)
-    try:
-        ta = a.TangentAt(a.Domain.Max)
-        tb = b.TangentAt(b.Domain.Min)
-        a_prev = _to_xy(plane, a.PointAt(a.Domain.Max) - ta * max(radius, 1.0))
-        b_next = _to_xy(plane, b.PointAt(b.Domain.Min) + tb * max(radius, 1.0))
-    except Exception:
-        a_prev = pa
-        b_next = pb
-    corner = _line_intersect_unbounded(a_prev, pa, pb, b_next)
-    if corner is None:
-        corner = ((pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5)
-    chain = _constant_radius_fillet(a_prev, corner, b_next, radius, ring)
-    return _arc_from_chain(plane, chain, radius, ring)
+    """Fallback G2 quintic when CreateBlendCurve is not available."""
+    return _fair_blend_between(a, b, radius, plane, ring)
 
 
 def _end_cap_arc(feat, radius, plane, ring):
@@ -1982,10 +2316,10 @@ def _join_closed_pieces(pieces):
 
 
 def _nurbs_same_tip_caps(curve, distance, radius, plane, ring, features):
-    """Offset the original spans and close every tip with the same G1 radius.
+    """Offset the original spans and close every tip with the same G2 fair blend.
 
-    Output is a PolyCurve of the original-quality walls plus true ArcCurves —
-    never a dense interpolant.
+    Output is a PolyCurve of the original-quality walls plus few-CV NURBS
+    blends — never a dense interpolant.
     """
     if curve is None or radius < _tol():
         return None
@@ -2067,7 +2401,7 @@ def _nurbs_same_tip_caps(curve, distance, radius, plane, ring, features):
         if kind_end and feat is not None:
             cap = _end_cap_arc(feat, radius, plane, ring)
         if cap is None:
-            cap = _fillet_arc_between(a, b, radius)
+            cap = _fair_blend_between(a, b, radius, plane, ring)
         if cap is None:
             cap = _geometric_fillet_arc(a, b, radius, plane, ring)
         if cap is None:
@@ -2702,20 +3036,36 @@ def _self_test():
         assert_true(extent > 0.35, "triangle corner must not stay a sharp point (ext={0})".format(extent))
     assert_true(
         max(extents) - min(extents) < 2.0,
-        "all three triangle corners should close with the same min-diameter circle (ext={0})".format(extents),
+        "all three triangle corners should close with the same fair blend (ext={0})".format(extents),
     )
 
-    # Same G1 radius on every tip — the chain must land tangent to both walls.
+    # Same G2 fair blend on every tip — tangent to both walls, curvature eases in.
     fillet_r = 3.0
     walls = ((-8.0, 0.0), (0.0, 0.0), (4.0, 6.928))
     chain = _constant_radius_fillet(walls[0], walls[1], walls[2], fillet_r, bowed)
-    assert_true(len(chain) >= 4, "constant-radius fillet should be a sampled arc")
+    assert_true(len(chain) >= 6, "fair blend should be a sampled quintic")
     t_in = _vunit(_vsub(walls[1], walls[0]))
     t_out = _vunit(_vsub(walls[2], walls[1]))
     t_chain0 = _vunit(_vsub(chain[1], chain[0]))
     t_chain1 = _vunit(_vsub(chain[-1], chain[-2]))
-    assert_true(_vdot(t_in, t_chain0) > 0.97, "fillet must be G1 with the incoming wall")
-    assert_true(_vdot(t_out, t_chain1) > 0.97, "fillet must be G1 with the outgoing wall")
+    assert_true(_vdot(t_in, t_chain0) > 0.97, "blend must be G1 with the incoming wall")
+    assert_true(_vdot(t_out, t_chain1) > 0.97, "blend must be G1 with the outgoing wall")
+    kappas = []
+    for i in range(1, len(chain) - 1):
+        turn = _turn_at(chain[i - 1], chain[i], chain[i + 1])
+        ds = 0.5 * (_vdist(chain[i - 1], chain[i]) + _vdist(chain[i], chain[i + 1]))
+        if ds > 1e-6:
+            kappas.append(turn / ds)
+    assert_true(len(kappas) >= 4, "fair blend should have a curvature comb")
+    peak = max(kappas, key=lambda k: abs(k))
+    assert_true(abs(kappas[0]) < abs(peak) * 0.55, "curvature must ease in, not jump to a circle")
+    assert_true(abs(kappas[-1]) < abs(peak) * 0.55, "curvature must ease out, not jump to a circle")
+    flips = 0
+    signs = [1 if k > 0 else -1 for k in kappas if abs(k) > 0.02]
+    for i in range(1, len(signs)):
+        if signs[i] != signs[i - 1]:
+            flips += 1
+    assert_true(flips == 0, "fair blend must not S-wave (flips={0})".format(flips))
 
     print("PlasmaKerf math tests passed")
 
