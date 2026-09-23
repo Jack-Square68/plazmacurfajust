@@ -7,14 +7,12 @@ torch centerline. Enter bakes the result onto layers.
 
 Rhino 7 / 8
 -----------
-Closed openings are sampled once to a polyline (capped) for width. Each node
-on the original curve then moves out along its normal by a scaled amount:
-full grow at the pinch, fading with distance along the curve so the offset
-stays one smooth parallel. If the whole opening is under min width it is
-a single round-corner offset and stays closed. Slot ends get a MinWidth/2
-semicircle. Pointed corners of a wide opening stay as drawn.
-Rhino is not asked to CurveCurve / GetLength / Contains on every sample,
-so a koru no longer locks the UI.
+Closed openings are sampled once to a polyline (capped) for width only.
+The baked outline is the original NURBS, offset as spans, with the same
+MinWidth/2 G1 arc on every tip — not a 1200-point interpolant. Slot ends
+get a MinWidth/2 semicircle around the original tip. Pointed corners of a
+wide opening stay as drawn. Rhino is not asked to CurveCurve / GetLength /
+Contains on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -929,32 +927,83 @@ def _original_features(feature_ring, samples, grow, min_width):
     return features
 
 
+def _constant_radius_fillet(a, b, c, radius, ring):
+    """G1 fillet of exactly `radius` — same on every tip, tangent to both walls."""
+    if radius < 0.04:
+        return [b]
+    t1 = _vunit(_vsub(b, a))
+    t2 = _vunit(_vsub(c, b))
+    if (t1[0] == 0.0 and t1[1] == 0.0) or (t2[0] == 0.0 and t2[1] == 0.0):
+        return [b]
+    turn = math.atan2(_vcross(t1, t2), _vdot(t1, t2))
+    if abs(turn) < 0.08:
+        return [b]
+    if abs(turn) > 2.4 or _vdot(t1, t2) < -0.90:
+        return _end_cap_chain(b, a, c, radius, ring)
+    tan_h = math.tan(abs(turn) * 0.5)
+    if tan_h < 1e-8:
+        return [b]
+    trim = radius * tan_h
+    p0 = (b[0] - t1[0] * trim, b[1] - t1[1] * trim)
+    p1 = (b[0] + t2[0] * trim, b[1] + t2[1] * trim)
+    left = (-t1[1], t1[0])
+    inward = left if turn > 0.0 else (-left[0], -left[1])
+    # Centre sits on the inside of the offset corner. Do not flip from the
+    # original ring: that centre often still lies in the old slot.
+    center = (p0[0] + inward[0] * radius, p0[1] + inward[1] * radius)
+    return [p0] + _arc_points(center, p0, p1, radius, ring) + [p1]
+
+
+def _cap_all_tips_same(moved, tips, radius, ring):
+    """Replace every tip with the same tangent radius so they match and stay G1."""
+    if len(moved) < 6 or not tips or radius < 0.04:
+        return moved, []
+    protected = []
+    walk = max(radius * 2.2, 3.0)
+    for tip in tips:
+        if tip is None:
+            continue
+        i, _ = _nearest_index(moved, tip)
+        p_l, i_l = _walk_along(moved, i, -1, walk)
+        p_r, i_r = _walk_along(moved, i, 1, walk)
+        p_ll, _ = _walk_along(moved, i_l, -1, max(radius, 1.0))
+        p_rr, _ = _walk_along(moved, i_r, 1, max(radius, 1.0))
+        corner = _line_intersect_unbounded(p_ll, p_l, p_r, p_rr)
+        if corner is None:
+            corner = moved[i]
+        chain = _constant_radius_fillet(p_ll, corner, p_rr, radius, ring)
+        if len(chain) < 2:
+            continue
+        nxt = _replace_span(moved, i_l, i_r, chain)
+        if len(nxt) >= 3:
+            moved = nxt
+            protected.extend(chain)
+    cleaned = _clean_ring(moved, 0.02) if len(moved) >= 3 else moved
+    return cleaned, protected
+
+
 def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, min_width):
-    """Splices half-min-width radii / end caps from the original CAD corners."""
+    """Same min-width-radius cap on every tip, tangent to the offset walls."""
     protected = []
     if len(moved) < 4 or min_width <= 0:
         return moved, protected
     radius = min_width * 0.5
     features = _original_features(feature_ring, samples, grow, min_width)
+    tips = []
     for feat in features:
-        vertex = feat.get("b") or feat.get("center")
         if feat["kind"] == "end":
+            vertex = feat.get("center")
             chain = _end_cap_chain(feat["center"], feat["p0"], feat["p1"], radius, interior_ring)
-            splice_r = radius
+            if len(chain) >= 2:
+                nxt = _splice_feature(moved, chain, vertex, radius)
+                if nxt is not moved and len(nxt) >= 3:
+                    moved = nxt
+                    protected.extend(chain)
         else:
-            grow1 = max(_grow_near(feat["a"], samples, grow), _grow_near(feat["b"], samples, grow))
-            grow2 = max(_grow_near(feat["b"], samples, grow), _grow_near(feat["c"], samples, grow))
-            join_r = max(grow1, grow2)
-            if join_r < 0.08:
-                continue
-            chain = _vertex_round_join(feat["a"], feat["b"], feat["c"], join_r, interior_ring)
-            splice_r = join_r
-        if len(chain) < 2:
-            continue
-        nxt = _splice_feature(moved, chain, vertex, splice_r)
-        if nxt is not moved and len(nxt) >= 3:
-            moved = nxt
-            protected.extend(chain)
+            tips.append(feat.get("b") or feat.get("center"))
+    if tips:
+        moved, extra = _cap_all_tips_same(moved, tips, radius, interior_ring)
+        protected.extend(extra)
     cleaned = _clean_ring(moved, 0.02) if len(moved) >= 3 else moved
     return cleaned, protected
 
@@ -1477,7 +1526,7 @@ def _curve_self_intersects(curve):
 
 
 def _interpolated_closed(plane, ring):
-    """Degree-3 NURBS through the offset points. Reject a looped interpolation."""
+    """Dense interpolant — do not use for the baked outline (few-node NURBS only)."""
     if len(ring) < 4:
         return _polyline_curve(plane, ring)
     pts = [_from_xy(plane, p) for p in ring]
@@ -1586,6 +1635,536 @@ def _grow_opening(curve, distance, corners="Round"):
     return _force_closed_curve(best)
 
 
+def _kink_parameters(curve):
+    """C1 breaks around a closed curve, including a kink at Domain.Min."""
+    ts = []
+    try:
+        domain = curve.Domain
+    except Exception:
+        return ts
+    t = domain.Min
+    try:
+        if curve.IsClosed and not curve.IsContinuous(rg.Continuity.C1_locus, domain.Min):
+            ts.append(domain.Min)
+    except Exception:
+        pass
+    guard = 0
+    while guard < 64:
+        guard += 1
+        try:
+            got = curve.GetNextDiscontinuity(rg.Continuity.C1_locus, t, domain.Max)
+        except Exception:
+            break
+        ok = False
+        nxt = t
+        if isinstance(got, tuple):
+            if len(got) >= 2:
+                ok, nxt = bool(got[0]), got[1]
+        elif got:
+            ok = True
+            nxt = got
+        if not ok:
+            break
+        t = nxt
+        if ts and abs(t - ts[0]) <= _tol():
+            break
+        ts.append(t)
+        if t >= domain.Max - _tol():
+            break
+    return ts
+
+
+def _polyline_spans(curve):
+    try:
+        ok, pline = curve.TryGetPolyline()
+    except Exception:
+        return []
+    if not ok or pline is None:
+        return []
+    try:
+        count = pline.Count
+    except Exception:
+        return []
+    pts = [pline[i] for i in range(count)]
+    if len(pts) > 2 and pts[0].DistanceTo(pts[-1]) <= _tol() * 4:
+        pts = pts[:-1]
+    if len(pts) < 2:
+        return []
+    spans = []
+    n = len(pts)
+    last = n if curve.IsClosed else n - 1
+    for i in range(last):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        if a.DistanceTo(b) <= _tol():
+            continue
+        try:
+            spans.append(rg.LineCurve(a, b))
+        except Exception:
+            pass
+    return spans
+
+
+def _split_closed_spans(curve):
+    """Wall spans between original kinks — keeps each NURBS piece intact."""
+    poly = _polyline_spans(curve)
+    if len(poly) >= 2:
+        return poly
+    ts = _kink_parameters(curve)
+    if len(ts) >= 1:
+        try:
+            pieces = curve.Split(ts)
+        except Exception:
+            pieces = None
+        got = [c for c in _as_list(pieces) if c is not None and c.IsValid]
+        if len(got) >= 2:
+            return got
+    dup = curve.DuplicateCurve()
+    return [dup] if dup else []
+
+
+def _span_length(curve):
+    try:
+        return curve.GetLength()
+    except Exception:
+        return 0.0
+
+
+def _drop_short_tip_spans(spans, radius):
+    """Drop pre-rounded tip blends so every tip can take the same fillet."""
+    if len(spans) <= 2:
+        return spans
+    lengths = [_span_length(s) for s in spans]
+    ordered = sorted(lengths)
+    typical = ordered[len(ordered) // 2]
+    keep = []
+    for span, length in zip(spans, lengths):
+        if length < max(radius * 0.85, 0.4) and length < typical * 0.35:
+            continue
+        keep.append(span)
+    return keep if len(keep) >= 2 else spans
+
+
+def _span_mid_xy(span, plane):
+    try:
+        t = 0.5 * (span.Domain.Min + span.Domain.Max)
+        return _to_xy(plane, span.PointAt(t))
+    except Exception:
+        return None
+
+
+def _span_outward_offset(span, plane, distance, ring):
+    """Offset one open wall away from the opening interior."""
+    if span is None:
+        return None
+    if distance <= _tol():
+        dup = span.DuplicateCurve()
+        return dup if dup and dup.IsValid else span
+    candidates = []
+    for signed in (distance, -distance):
+        candidates.extend(_offset(span, plane, signed, "Sharp"))
+    best = None
+    best_score = -1e300
+    orig_mid = _span_mid_xy(span, plane)
+    for cand in candidates:
+        if cand is None or not cand.IsValid:
+            continue
+        mid = _span_mid_xy(cand, plane)
+        if mid is None:
+            continue
+        inside = _point_in_ring(mid, ring)
+        score = -1000.0 if inside else 1000.0
+        score += _span_length(cand)
+        if orig_mid is not None and not inside:
+            score += _vdist(mid, orig_mid)
+        if score > best_score:
+            best = cand
+            best_score = score
+    return best
+
+
+def _orient_span_loop(spans):
+    """Flip each span so End of i sits next to Start of i+1."""
+    if not spans:
+        return []
+    out = [s.DuplicateCurve() for s in spans]
+    if len(out) == 1:
+        return out
+    for i in range(1, len(out)):
+        prev_end = out[i - 1].PointAtEnd
+        if out[i].PointAtStart.DistanceTo(prev_end) > out[i].PointAtEnd.DistanceTo(prev_end):
+            out[i].Reverse()
+    if out[0].PointAtStart.DistanceTo(out[-1].PointAtEnd) > out[0].PointAtEnd.DistanceTo(out[-1].PointAtEnd):
+        out[0].Reverse()
+        for i in range(1, len(out)):
+            prev_end = out[i - 1].PointAtEnd
+            if out[i].PointAtStart.DistanceTo(prev_end) > out[i].PointAtEnd.DistanceTo(prev_end):
+                out[i].Reverse()
+    return out
+
+
+def _fillet_arc_between(a, b, radius):
+    """True Arc of `radius` tangent to two offset walls. Never an interpolant."""
+    if a is None or b is None or radius < _tol():
+        return None
+    pairs = [
+        (a.PointAtEnd, b.PointAtStart),
+        (a.PointAtEnd, b.PointAtEnd),
+        (a.PointAtStart, b.PointAtStart),
+        (a.PointAtStart, b.PointAtEnd),
+    ]
+    pa, pb = min(pairs, key=lambda p: p[0].DistanceTo(p[1]))
+    try:
+        result = rg.Curve.CreateFilletCurves(
+            a, pa, b, pb, radius, False, False, True, _tol(), 0.1
+        )
+    except Exception:
+        result = None
+    for crv in _as_list(result):
+        if crv is not None and crv.IsValid and _span_length(crv) > _tol():
+            return crv
+    try:
+        ok_a, ta = a.ClosestPoint(pa)
+        ok_b, tb = b.ClosestPoint(pb)
+        if ok_a and ok_b:
+            arc = rg.Curve.CreateFillet(a, b, radius, ta, tb)
+            if arc is not None:
+                try:
+                    crv = rg.ArcCurve(arc)
+                except Exception:
+                    crv = arc
+                if crv is not None and getattr(crv, "IsValid", True):
+                    return crv
+    except Exception:
+        pass
+    return None
+
+
+def _arc_from_chain(plane, chain, radius, ring):
+    """Build one ArcCurve through a 2D G1 chain (p0 + arc + p1)."""
+    if not chain or len(chain) < 2:
+        return None
+    p0 = chain[0]
+    p1 = chain[-1]
+    mid = chain[len(chain) // 2]
+    try:
+        arc = rg.Arc(_from_xy(plane, p0), _from_xy(plane, mid), _from_xy(plane, p1))
+        if arc.IsValid:
+            crv = rg.ArcCurve(arc)
+            if crv is not None and crv.IsValid:
+                return crv
+    except Exception:
+        pass
+    return rg.LineCurve(_from_xy(plane, p0), _from_xy(plane, p1))
+
+
+def _geometric_fillet_arc(a, b, radius, plane, ring):
+    pa = _to_xy(plane, a.PointAtEnd)
+    pb = _to_xy(plane, b.PointAtStart)
+    try:
+        ta = a.TangentAt(a.Domain.Max)
+        tb = b.TangentAt(b.Domain.Min)
+        a_prev = _to_xy(plane, a.PointAt(a.Domain.Max) - ta * max(radius, 1.0))
+        b_next = _to_xy(plane, b.PointAt(b.Domain.Min) + tb * max(radius, 1.0))
+    except Exception:
+        a_prev = pa
+        b_next = pb
+    corner = _line_intersect_unbounded(a_prev, pa, pb, b_next)
+    if corner is None:
+        corner = ((pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5)
+    chain = _constant_radius_fillet(a_prev, corner, b_next, radius, ring)
+    return _arc_from_chain(plane, chain, radius, ring)
+
+
+def _end_cap_arc(feat, radius, plane, ring):
+    chain = _end_cap_chain(feat["center"], feat["p0"], feat["p1"], radius, ring)
+    return _arc_from_chain(plane, chain, radius, ring)
+
+
+def _closest_end_feature(features, point_xy, radius):
+    best = None
+    best_d = radius * 4.0
+    for feat in features:
+        if feat.get("kind") != "end":
+            continue
+        center = feat.get("center")
+        if center is None:
+            continue
+        d = _vdist(point_xy, center)
+        if d < best_d:
+            best = feat
+            best_d = d
+    return best
+
+
+def _span_end_xy(span, plane, at_start):
+    pt = span.PointAtStart if at_start else span.PointAtEnd
+    return _to_xy(plane, pt)
+
+
+def _nearest_span_index(spans, point_xy, plane):
+    best_i = 0
+    best = 1e300
+    for i, span in enumerate(spans):
+        mid = _span_mid_xy(span, plane)
+        if mid is None:
+            continue
+        d = _vdist(mid, point_xy)
+        if d < best:
+            best = d
+            best_i = i
+    return best_i
+
+
+def _touch_param(wall, cap, prefer_start):
+    """Parameter on `wall` nearest the cap end that lands on this wall."""
+    if wall is None or cap is None:
+        return None
+    pts = [cap.PointAtStart, cap.PointAtEnd]
+    best_t = None
+    best_d = 1e300
+    prefer = wall.PointAtStart if prefer_start else wall.PointAtEnd
+    for pt in pts:
+        try:
+            ok, t = wall.ClosestPoint(pt)
+        except Exception:
+            ok, t = False, None
+        if not ok:
+            continue
+        d = wall.PointAt(t).DistanceTo(pt)
+        d += wall.PointAt(t).DistanceTo(prefer) * 0.01
+        if d < best_d:
+            best_d = d
+            best_t = t
+    return best_t
+
+
+def _trim_wall_to_caps(wall, cap_prev, cap_next):
+    t0 = _touch_param(wall, cap_prev, True)
+    t1 = _touch_param(wall, cap_next, False)
+    if t0 is None or t1 is None:
+        return wall
+    if abs(t1 - t0) <= _tol():
+        return wall
+    if t0 > t1:
+        try:
+            wall = wall.DuplicateCurve()
+            wall.Reverse()
+        except Exception:
+            return wall
+        t0 = _touch_param(wall, cap_prev, True)
+        t1 = _touch_param(wall, cap_next, False)
+        if t0 is None or t1 is None or t0 > t1 or abs(t1 - t0) <= _tol():
+            return wall
+    try:
+        trimmed = wall.Trim(t0, t1)
+        if trimmed is not None and trimmed.IsValid:
+            return trimmed
+    except Exception:
+        pass
+    return wall
+
+
+def _join_closed_pieces(pieces):
+    valid = [p for p in pieces if p is not None and getattr(p, "IsValid", True)]
+    if not valid:
+        return None
+    joined = _join(valid)
+    if not joined:
+        return None
+    best = max(joined, key=_span_length)
+    best = _force_closed_curve(best)
+    if best is None or not best.IsValid:
+        return None
+    if _curve_self_intersects(best):
+        return None
+    return best
+
+
+def _nurbs_same_tip_caps(curve, distance, radius, plane, ring, features):
+    """Offset the original spans and close every tip with the same G1 radius.
+
+    Output is a PolyCurve of the original-quality walls plus true ArcCurves —
+    never a dense interpolant.
+    """
+    if curve is None or radius < _tol():
+        return None
+    spans = _drop_short_tip_spans(_split_closed_spans(curve), radius)
+    if not spans:
+        return None
+
+    if len(spans) == 1:
+        grown = _grow_opening(curve, distance, "Sharp") if distance > _tol() else curve.DuplicateCurve()
+        return _force_closed_curve(grown)
+
+    offset_spans = []
+    for span in spans:
+        off = _span_outward_offset(span, plane, distance, ring)
+        if off is None:
+            line = None
+            try:
+                line = rg.LineCurve(span.PointAtStart, span.PointAtEnd)
+            except Exception:
+                line = None
+            off = _span_outward_offset(line, plane, distance, ring) if line else None
+        if off is None:
+            return None
+        offset_spans.append(off)
+    offset_spans = _orient_span_loop(offset_spans)
+    n = len(offset_spans)
+    if n < 2:
+        return None
+
+    keep = [True] * n
+    end_for_span = [None] * n
+    for feat in features:
+        if feat.get("kind") != "end":
+            continue
+        center = feat.get("center")
+        if center is None:
+            continue
+        idx = _nearest_span_index(offset_spans, center, plane)
+        # Only drop a short end-wall, not a long side that merely sits near a tip.
+        if _span_length(offset_spans[idx]) < max(radius * 3.2, 8.0):
+            keep[idx] = False
+            end_for_span[idx] = feat
+
+    kept_idx = [i for i in range(n) if keep[i]]
+    if len(kept_idx) < 2:
+        kept_idx = list(range(n))
+        keep = [True] * n
+
+    caps = []
+    walls = []
+    m = len(kept_idx)
+    for k in range(m):
+        i = kept_idx[k]
+        j = kept_idx[(k + 1) % m]
+        walls.append(offset_spans[i])
+        dropped = []
+        t = (i + 1) % n
+        while t != j:
+            dropped.append(t)
+            t = (t + 1) % n
+        feat = None
+        for d in dropped:
+            if end_for_span[d] is not None:
+                feat = end_for_span[d]
+                break
+        joint = _span_end_xy(offset_spans[i], plane, False)
+        if feat is None:
+            feat = _closest_end_feature(features, joint, radius)
+        if dropped:
+            kind_end = feat is not None
+        elif feat is not None:
+            kind_end = _vdist(joint, feat["center"]) < radius * 1.6
+        else:
+            kind_end = False
+
+        a = offset_spans[i]
+        b = offset_spans[j]
+        cap = None
+        if kind_end and feat is not None:
+            cap = _end_cap_arc(feat, radius, plane, ring)
+        if cap is None:
+            cap = _fillet_arc_between(a, b, radius)
+        if cap is None:
+            cap = _geometric_fillet_arc(a, b, radius, plane, ring)
+        if cap is None:
+            return None
+        caps.append(cap)
+
+    pieces = []
+    for k in range(m):
+        wall = _trim_wall_to_caps(walls[k], caps[(k - 1 + m) % m], caps[k])
+        pieces.append(wall)
+        pieces.append(caps[k])
+    return _join_closed_pieces(pieces)
+
+
+def _move_nurbs_cvs(curve, plane, samples, deltas, ring):
+    """Slide the original CVs — same few nodes, local grow, no interpolant."""
+    if curve is None or not samples or not deltas:
+        return None
+    try:
+        nurbs = curve.ToNurbsCurve()
+    except Exception:
+        return None
+    if nurbs is None or not nurbs.IsValid:
+        return None
+    try:
+        count = nurbs.Points.Count
+    except Exception:
+        return None
+    if count < 3:
+        return None
+    greville = None
+    try:
+        greville = list(nurbs.GrevilleParameters())
+    except Exception:
+        greville = None
+    for i in range(count):
+        try:
+            loc = nurbs.Points[i].Location
+        except Exception:
+            try:
+                loc = nurbs.Points[i]
+            except Exception:
+                continue
+        t = greville[i] if greville and i < len(greville) else None
+        if t is not None:
+            try:
+                pt = nurbs.PointAt(t)
+                tan = nurbs.TangentAt(t)
+            except Exception:
+                pt, tan = loc, None
+            delta = _value_at_t(samples, deltas, t)
+        else:
+            pt, tan = loc, None
+            xy = _to_xy(plane, loc)
+            best_i = 0
+            best_d = 1e300
+            for si, sample in enumerate(samples):
+                d = _vdist(xy, sample["point"])
+                if d < best_d:
+                    best_d = d
+                    best_i = si
+            delta = deltas[best_i] if best_i < len(deltas) else 0.0
+        if delta <= 1e-6:
+            continue
+        xy = _to_xy(plane, pt)
+        if tan is not None:
+            tan2 = _vunit((tan * plane.XAxis, tan * plane.YAxis))
+            inward = _vleft(tan2)
+        else:
+            inward = (0.0, 0.0)
+        if inward[0] == 0.0 and inward[1] == 0.0:
+            continue
+        probe = _vadd(xy, _vmul(inward, 0.2))
+        if not _point_in_ring(probe, ring):
+            inward = _vmul(inward, -1.0)
+        outward = _vmul(inward, -1.0)
+        cv_xy = _vadd(_to_xy(plane, loc), _vmul(outward, delta))
+        new_pt = _from_xy(plane, cv_xy)
+        try:
+            nurbs.Points.SetPoint(i, new_pt)
+        except Exception:
+            try:
+                nurbs.Points[i] = new_pt
+            except Exception:
+                return None
+    if not nurbs.IsValid:
+        return None
+    return _force_closed_curve(nurbs)
+
+
+def _grow_is_uniform(raw):
+    pos = [v for v in raw if v > 0.04]
+    if len(pos) < 3:
+        return False
+    return max(pos) <= min(pos) * 1.35 + 0.15
+
+
 _CLOSED_PREP = {}
 
 
@@ -1594,7 +2173,7 @@ def _clear_closed_prep():
 
 
 def _ensure_min_width(curve, min_width, corners):
-    """Offset each original node along its normal, scaled by distance from the pinch."""
+    """Widen under-min-width stretches; keep the original NURBS + same-radius tips."""
     plane = _curve_plane(curve)
     try:
         length = curve.GetLength()
@@ -1612,44 +2191,45 @@ def _ensure_min_width(curve, min_width, corners):
         width_count = min(320, max(96, int(math.ceil(length / 1.0))))
         samples = _samples_from_curve(curve, plane, ring, width_count)
         spacing = length / float(max(len(samples), 1))
-        node_count = min(1200, max(240, int(math.ceil(length / 0.3))))
-        nodes = _samples_from_curve(curve, plane, ring, node_count)
         corners_xy = _curve_corners_xy(curve, plane)
-        prep = (plane, ring, samples, spacing, nodes, corners_xy)
+        prep = (plane, ring, samples, spacing, corners_xy)
         _CLOSED_PREP[key] = prep
-    plane, ring, samples, spacing, nodes, corners_xy = prep
+    plane, ring, samples, spacing, corners_xy = prep
     _assign_widths(samples, ring, min_width)
     raw = _raw_deltas(samples, min_width)
     if not any(d > 1e-4 for d in raw):
         return [curve.DuplicateCurve()], 0, []
-    raw_nodes = [_value_at_t(samples, raw, node["t"]) for node in nodes]
-    deltas, pinches = _distance_scaled_deltas(nodes, raw_nodes, min_width)
+    deltas, pinches = _distance_scaled_deltas(samples, raw, min_width)
     if pinches == 0:
         return [curve.DuplicateCurve()], 0, []
     feature_ring = corners_xy if len(corners_xy) >= 3 else ring
-    features = _original_features(feature_ring, nodes, deltas, min_width)
-    has_slot_end = any(f.get("kind") == "end" for f in features)
-    if _mostly_thin(raw) and not has_slot_end:
-        grown = _grow_opening(curve, _median_positive(raw), "Round")
-        if grown is not None:
-            return [grown], pinches, []
-    moved = [_offset_point(nodes[i], deltas[i], ring) for i in range(len(nodes))]
-    moved = _remove_loops(_clean_ring(moved, 0.02))
-    moved, protected = _apply_original_features(
-        moved, feature_ring, ring, nodes, deltas, min_width
-    )
-    moved = _round_short_ends(moved, ring, min_width, protected)
-    moved = _remove_loops(moved)
-    if protected:
-        outline_curve = _polyline_curve(plane, moved)
+    features = _original_features(feature_ring, samples, deltas, min_width)
+    radius = min_width * 0.5
+    distance = _median_positive(raw)
+
+    outline = None
+    if _mostly_thin(raw) or _grow_is_uniform(raw):
+        outline = _nurbs_same_tip_caps(curve, distance, radius, plane, ring, features)
+        if outline is None:
+            grown = _grow_opening(curve, distance, "Sharp")
+            if grown is not None:
+                outline = _nurbs_same_tip_caps(grown, 0.0, radius, plane, ring, features)
+                if outline is None:
+                    outline = grown
     else:
-        outline_curve = _interpolated_closed(plane, moved)
-    if outline_curve is None:
-        outline_curve = _polyline_curve(plane, moved)
-    outline_curve = _force_closed_curve(outline_curve)
-    if outline_curve is None or not outline_curve.IsValid:
+        moved = _move_nurbs_cvs(curve, plane, samples, deltas, ring)
+        if moved is not None:
+            outline = _nurbs_same_tip_caps(moved, 0.0, radius, plane, ring, features)
+            if outline is None:
+                outline = moved
+
+    if outline is None or not getattr(outline, "IsValid", False):
+        # Last resort: keep the original NURBS. Never emit a dense interpolant.
         return [curve.DuplicateCurve()], pinches, []
-    return [outline_curve], pinches, []
+    outline = _force_closed_curve(outline)
+    if outline is None or not outline.IsValid:
+        return [curve.DuplicateCurve()], pinches, []
+    return [outline], pinches, []
 
 
 def _inset_closed(curves, distance, corners):
@@ -2124,6 +2704,18 @@ def _self_test():
         max(extents) - min(extents) < 2.0,
         "all three triangle corners should close with the same min-diameter circle (ext={0})".format(extents),
     )
+
+    # Same G1 radius on every tip — the chain must land tangent to both walls.
+    fillet_r = 3.0
+    walls = ((-8.0, 0.0), (0.0, 0.0), (4.0, 6.928))
+    chain = _constant_radius_fillet(walls[0], walls[1], walls[2], fillet_r, bowed)
+    assert_true(len(chain) >= 4, "constant-radius fillet should be a sampled arc")
+    t_in = _vunit(_vsub(walls[1], walls[0]))
+    t_out = _vunit(_vsub(walls[2], walls[1]))
+    t_chain0 = _vunit(_vsub(chain[1], chain[0]))
+    t_chain1 = _vunit(_vsub(chain[-1], chain[-2]))
+    assert_true(_vdot(t_in, t_chain0) > 0.97, "fillet must be G1 with the incoming wall")
+    assert_true(_vdot(t_out, t_chain1) > 0.97, "fillet must be G1 with the outgoing wall")
 
     print("PlasmaKerf math tests passed")
 
