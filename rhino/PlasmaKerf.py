@@ -542,11 +542,54 @@ def _turn_at(a, b, c):
     return math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
 
 
+def _walk_along(points, start, step, distance):
+    n = len(points)
+    acc = 0.0
+    i = start
+    guard = 0
+    while acc < distance - 1e-9 and guard < n:
+        guard += 1
+        j = (i + step + n) % n
+        seg = _vdist(points[i], points[j])
+        if seg < 1e-12:
+            i = j
+            continue
+        if acc + seg >= distance:
+            t = (distance - acc) / seg
+            pt = (points[i][0] + (points[j][0] - points[i][0]) * t,
+                  points[i][1] + (points[j][1] - points[i][1]) * t)
+            return pt, i
+        acc += seg
+        i = j
+    return points[i], i
+
+
+def _mark_span(used, start, end, through, n):
+    for step in (1, -1):
+        idxs = []
+        i = start
+        for _ in range(n):
+            idxs.append(i)
+            if i == end:
+                break
+            i = (i + step + n) % n
+        if through in idxs:
+            for i in idxs:
+                used[i] = True
+            return
+
+
+def _semicircle_cap(p0, p1, radius, ring):
+    mid = ((p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5)
+    return [p0] + _arc_points(mid, p0, p1, radius, ring) + [p1]
+
+
 def _round_short_ends(points, ring, min_width):
-    """Turn a blunt bar-end (two corners + short cap) into one semicircle."""
+    """Cap slot / taper ends with a semicircle of radius min_width/2."""
     n = len(points)
     if n < 8 or min_width <= 0:
         return points
+    radius = min_width * 0.5
     used = [False] * n
     out = []
     i = 0
@@ -565,27 +608,39 @@ def _round_short_ends(points, ring, min_width):
         tc = _turn_at(b, c, d)
         in_dir = _vunit(_vsub(b, a))
         out_dir = _vunit(_vsub(d, c))
-        # A real blunt slot-end has opposite walls. A flattened V does not.
         opposite_walls = _vdot(in_dir, out_dir) < -0.72
         blunt = (
-            min_width * 0.3 < edge < min_width * 1.4
-            and prev_len > max(edge * 1.5, min_width * 0.8)
-            and next_len > max(edge * 1.5, min_width * 0.8)
+            min_width * 0.45 < edge < min_width * 1.45
+            and prev_len > max(edge * 1.4, min_width * 0.7)
+            and next_len > max(edge * 1.4, min_width * 0.7)
             and abs(tb) > 0.65
             and abs(tc) > 0.65
             and tb * tc > 0
             and opposite_walls
         )
         if blunt and not used[(i + 1) % n]:
-            mid = ((b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5)
-            radius = max(edge * 0.5, 0.08)
-            out.append(b)
-            out.extend(_arc_points(mid, b, c, radius, ring))
-            out.append(c)
+            out.extend(_semicircle_cap(b, c, radius, ring))
             used[i] = True
             used[(i + 1) % n] = True
             i += 2
             continue
+
+        # Hairpin / leftover offset loop: walk back until the walls are min-width apart.
+        if abs(tb) > 1.75:
+            cap = None
+            for dist in (radius * 0.75, radius, radius * 1.2, radius * 1.5):
+                p0, i0 = _walk_along(points, i, -1, dist)
+                p1, i1 = _walk_along(points, i, 1, dist)
+                chord = _vdist(p0, p1)
+                if min_width * 0.7 < chord < min_width * 1.25:
+                    cap = (p0, p1, i0, i1)
+                    break
+            if cap is not None:
+                p0, p1, i0, i1 = cap
+                out.extend(_semicircle_cap(p0, p1, radius, ring))
+                _mark_span(used, i0, i1, i, n)
+                i += 1
+                continue
         out.append(b)
         used[i] = True
         i += 1
@@ -664,6 +719,15 @@ def _closed_arc_dist(pref, total, i, j):
     return fwd if fwd < rev else rev
 
 
+def _smootherstep(t):
+    """C2 fade. 0 and 1 are flat so the offset lands back on the original."""
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+
 def _distance_scaled_deltas(samples, raw, min_width):
     """Move each node by a falloff of the grow needed at the nearest pinch."""
     n = len(samples)
@@ -671,9 +735,7 @@ def _distance_scaled_deltas(samples, raw, min_width):
         return [0.0] * n, 0
     pref, total = _closed_arc_prefix(samples)
     pinch = [i for i, d in enumerate(raw) if d > 0.04]
-    fade = max(min_width * 1.75, 5.0)
-    inv = 1.0 / (2.0 * fade * fade)
-    reach = fade * 3.2
+    fade = max(min_width * 2.8, 10.0)
     deltas = [0.0] * n
     for i in range(n):
         best = raw[i]
@@ -681,12 +743,12 @@ def _distance_scaled_deltas(samples, raw, min_width):
             if p == i:
                 continue
             dist = _closed_arc_dist(pref, total, i, p)
-            if dist > reach:
+            if dist >= fade:
                 continue
-            val = raw[p] * math.exp(-dist * dist * inv)
+            val = raw[p] * _smootherstep(1.0 - dist / fade)
             if val > best:
                 best = val
-        deltas[i] = 0.0 if best <= 0.08 else best
+        deltas[i] = best if best > 1e-4 else 0.0
     return deltas, _thin_runs([d > 0.08 for d in deltas])
 
 
@@ -1068,6 +1130,8 @@ def _ensure_min_width(curve, min_width, corners):
         return [curve.DuplicateCurve()], 0, []
     moved = [_offset_point(nodes[i], deltas[i], ring) for i in range(len(nodes))]
     moved = _remove_loops(_clean_ring(moved, 0.02))
+    moved = _round_short_ends(moved, ring, min_width)
+    moved = _remove_loops(moved)
     outline_curve = _interpolated_closed(plane, moved)
     if outline_curve is None:
         return [curve.DuplicateCurve()], pinches, []
@@ -1387,8 +1451,8 @@ def _self_test():
     assert_true(5.4 < height < 7.2, "thin slot height should be ~6, got {0}".format(height))
     assert_true(max(xs) - min(xs) > 79.0, "thin slot should keep its length")
     assert_true(
-        max(xs) - min(xs) > 81.5,
-        "thin slot ends should be a single radius, not a flat bar ({0})".format(max(xs) - min(xs)),
+        84.5 < max(xs) - min(xs) < 88.0,
+        "thin slot ends should be a half-min-width radius (len={0})".format(max(xs) - min(xs)),
     )
 
     tiny = [(0.0, 0.0), (5.0, 0.0), (5.0, 1.0), (0.0, 1.0)]
