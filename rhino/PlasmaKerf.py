@@ -7,13 +7,12 @@ torch centerline. Enter bakes the result onto layers.
 
 Rhino 7 / 8
 -----------
-Closed openings are sampled once to a polyline (capped) for width. Already-wide
-walls keep the original NURBS. Only under-width pinches move out along the
-original normals and are G2-blended back, so a circular band stays circular.
-Pointed corners of a wide opening stay as drawn. Sharp corners on a grown
-pinch get a simple wall-to-wall radius, not a bulge. Rhino is not asked to
-CurveCurve / GetLength / Contains on every sample, so a koru no longer locks
-the UI.
+Closed openings are sampled once to a polyline (capped) for width. Each node
+on the original curve then moves out along its normal by a scaled amount:
+full grow at the pinch, fading with distance along the curve so the offset
+stays one smooth parallel. Pointed corners of a wide opening stay as drawn.
+Rhino is not asked to CurveCurve / GetLength / Contains on every sample, so
+a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -298,26 +297,6 @@ def _local_width(origin, inward, ring, skip_edge, min_width=0.0, prefix=None):
     return best
 
 
-def _smooth_closed_values(values, sigma):
-    if not values or sigma < 0.35:
-        return list(values)
-    radius = max(1, int(math.ceil(sigma * 3)))
-    kernel = []
-    total = 0.0
-    for i in range(-radius, radius + 1):
-        k = math.exp(-(i * i) / (2.0 * sigma * sigma))
-        kernel.append(k)
-        total += k
-    n = len(values)
-    out = []
-    for i in range(n):
-        acc = 0.0
-        for j in range(-radius, radius + 1):
-            acc += values[(i + j) % n] * kernel[j + radius]
-        out.append(acc / total)
-    return out
-
-
 def _flag_runs(flags):
     """Inclusive (start, end) runs. A wrap-around run has start > end."""
     n = len(flags)
@@ -347,35 +326,6 @@ def _run_indices(start, end, n):
     if start <= end:
         return list(range(start, end + 1))
     return list(range(start, n)) + list(range(0, end + 1))
-
-
-def _ordered_runs(flags):
-    """All True/False runs in cyclic order, starting at a run boundary."""
-    n = len(flags)
-    if n == 0:
-        return []
-    start = 0
-    for i in range(n):
-        if flags[i] != flags[(i - 1 + n) % n]:
-            start = i
-            break
-    else:
-        return [(0, n - 1, flags[0])]
-    out = []
-    i = start
-    while True:
-        val = flags[i]
-        j = i
-        while True:
-            nxt = (j + 1) % n
-            if nxt == start or flags[nxt] != val:
-                out.append((i, j, val))
-                i = nxt
-                break
-            j = nxt
-        if i == start:
-            break
-    return out
 
 
 def _value_at_t(samples, values, t):
@@ -679,10 +629,7 @@ def _nearest_edge(origin, ring):
     return best_i
 
 
-def _compute_deltas(samples, spacing, min_width):
-    """Per-sample outward grow. Isolated blips and leaked smoothing stay at 0."""
-    if len(samples) < 3 or min_width <= 0:
-        return [], 0
+def _raw_deltas(samples, min_width):
     raw = []
     for sample in samples:
         width = sample.get("width", float("inf"))
@@ -694,24 +641,61 @@ def _compute_deltas(samples, spacing, min_width):
     for i in range(len(raw)):
         if not flags[i]:
             raw[i] = 0.0
-    if not any(d > 1e-4 for d in raw):
-        return [0.0] * len(samples), 0
-    sigma = max(1.2, (min_width * 0.55) / max(spacing, 1e-6))
-    deltas = _smooth_closed_values(raw, sigma)
-    # Smoothing may leak into already-wide walls. Keep it only near a real pinch.
-    n = len(deltas)
-    keep = [False] * n
-    radius = max(2, int(math.ceil(sigma * 2.0)))
-    for i, flag in enumerate(flags):
-        if not flag:
-            continue
-        for j in range(-radius, radius + 1):
-            keep[(i + j) % n] = True
+    return raw
+
+
+def _closed_arc_prefix(samples):
+    n = len(samples)
+    pref = [0.0] * n
+    for i in range(1, n):
+        pref[i] = pref[i - 1] + _vdist(samples[i - 1]["point"], samples[i]["point"])
+    total = pref[-1] + _vdist(samples[-1]["point"], samples[0]["point"])
+    return pref, total
+
+
+def _closed_arc_dist(pref, total, i, j):
+    if i == j:
+        return 0.0
+    if i < j:
+        fwd = pref[j] - pref[i]
+    else:
+        fwd = total - (pref[i] - pref[j])
+    rev = total - fwd
+    return fwd if fwd < rev else rev
+
+
+def _distance_scaled_deltas(samples, raw, min_width):
+    """Move each node by a falloff of the grow needed at the nearest pinch."""
+    n = len(samples)
+    if n < 3 or not any(d > 1e-4 for d in raw):
+        return [0.0] * n, 0
+    pref, total = _closed_arc_prefix(samples)
+    pinch = [i for i, d in enumerate(raw) if d > 0.04]
+    fade = max(min_width * 1.75, 5.0)
+    inv = 1.0 / (2.0 * fade * fade)
+    reach = fade * 3.2
+    deltas = [0.0] * n
     for i in range(n):
-        if (not keep[i]) or deltas[i] <= 0.08:
-            deltas[i] = 0.0
-    pinches = _thin_runs([d > 0.08 for d in deltas])
-    return deltas, pinches
+        best = raw[i]
+        for p in pinch:
+            if p == i:
+                continue
+            dist = _closed_arc_dist(pref, total, i, p)
+            if dist > reach:
+                continue
+            val = raw[p] * math.exp(-dist * dist * inv)
+            if val > best:
+                best = val
+        deltas[i] = 0.0 if best <= 0.08 else best
+    return deltas, _thin_runs([d > 0.08 for d in deltas])
+
+
+def _compute_deltas(samples, spacing, min_width):
+    """Per-node outward grow, scaled by distance along the curve from the pinch."""
+    if len(samples) < 3 or min_width <= 0:
+        return [], 0
+    raw = _raw_deltas(samples, min_width)
+    return _distance_scaled_deltas(samples, raw, min_width)
 
 
 def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
@@ -1043,258 +1027,6 @@ def _interpolated_closed(plane, ring):
     return _polyline_curve(plane, ring)
 
 
-def _shape_thin_run(pts, deltas, ring, min_width, closed):
-    if len(pts) < 2:
-        return pts
-    cleaned = _clean_ring(pts, 0.02) if closed else list(pts)
-    if len(cleaned) < 2:
-        return pts
-    radii = []
-    for i in range(len(cleaned)):
-        nearest = min(range(len(pts)), key=lambda k: _vdist(cleaned[i], pts[k]))
-        radii.append(max(deltas[nearest], 0.0))
-    cleaned = _fillet_offset_ring(cleaned, radii, ring, closed)
-    if closed:
-        cleaned = _round_short_ends(cleaned, ring, min_width)
-        cleaned = _remove_loops(cleaned)
-    return cleaned if len(cleaned) >= 2 else pts
-
-
-def _interpolated_open(plane, pts):
-    if not HAS_RHINO or len(pts) < 2:
-        return None
-    rh_pts = [_from_xy(plane, p) for p in pts]
-    if len(pts) == 2:
-        try:
-            return rg.LineCurve(rh_pts[0], rh_pts[1])
-        except Exception:
-            return None
-    try:
-        crv = rg.Curve.CreateInterpolatedCurve(rh_pts, 3)
-        if crv is not None and crv.IsValid:
-            return crv
-    except Exception:
-        pass
-    try:
-        return rg.PolylineCurve(rh_pts)
-    except Exception:
-        return None
-
-
-def _trim_span(curve, t0, t1):
-    try:
-        if abs(t1 - t0) < 1e-9:
-            return []
-        if t1 > t0:
-            return [c for c in _as_list(curve.Trim(t0, t1)) if c]
-        domain = curve.Domain
-        a = _as_list(curve.Trim(t0, domain.Max))
-        b = _as_list(curve.Trim(domain.Min, t1))
-        return [c for c in a + b if c]
-    except Exception:
-        return []
-
-
-def _safe_length(curve):
-    try:
-        return curve.GetLength()
-    except Exception:
-        return 0.0
-
-
-def _param_at_length(curve, length):
-    total = _safe_length(curve)
-    if total < 1e-9:
-        return None
-    s = max(0.0, min(1.0, length / total))
-    try:
-        rc = curve.NormalizedLengthParameter(s)
-        if isinstance(rc, tuple):
-            if rc[0]:
-                return rc[1]
-        elif rc is not None:
-            return rc
-    except Exception:
-        pass
-    domain = curve.Domain
-    return domain.Min + (domain.Max - domain.Min) * s
-
-
-def _shorten_both(curve, start_len, end_len):
-    total = _safe_length(curve)
-    if total < 0.4:
-        return curve
-    start_len = max(0.0, start_len)
-    end_len = max(0.0, end_len)
-    if start_len + end_len >= total * 0.85:
-        cap = total * 0.2
-        start_len = min(start_len, cap)
-        end_len = min(end_len, cap)
-    t0 = _param_at_length(curve, start_len) if start_len > 1e-6 else curve.Domain.Min
-    t1 = _param_at_length(curve, total - end_len) if end_len > 1e-6 else curve.Domain.Max
-    if t0 is None or t1 is None or t1 <= t0:
-        return curve
-    got = [c for c in _as_list(curve.Trim(t0, t1)) if c]
-    return got[0] if got else curve
-
-
-def _make_blend(a, b):
-    styles = []
-    try:
-        styles.append(rg.BlendContinuity.Curvature)
-        styles.append(rg.BlendContinuity.Tangency)
-        styles.append(rg.BlendContinuity.Position)
-    except Exception:
-        styles.extend([2, 1, 0])
-    for style in styles:
-        try:
-            blend = rg.Curve.CreateBlendCurve(a, b, style)
-            if blend is not None and blend.IsValid:
-                return blend
-        except Exception:
-            continue
-    return None
-
-
-def _g2_join_closed(pieces, blend_len):
-    """Join a cyclic list of curves with curvature blends at each seam."""
-    n = len(pieces)
-    if n == 0:
-        return None
-    if n == 1:
-        crv = pieces[0]
-        if crv and (not crv.IsClosed):
-            try:
-                crv.MakeClosed(max(_tol() * 8, 0.2))
-            except Exception:
-                pass
-        return crv
-    uses = []
-    for i in range(n):
-        use = min(
-            blend_len,
-            _safe_length(pieces[i]) * 0.35,
-            _safe_length(pieces[(i + 1) % n]) * 0.35,
-        )
-        uses.append(use if use > 0.2 else 0.0)
-    short = []
-    for i in range(n):
-        short.append(_shorten_both(pieces[i], uses[(i - 1 + n) % n], uses[i]))
-    parts = []
-    for i in range(n):
-        parts.append(short[i])
-        if uses[i] > 0:
-            blend = _make_blend(short[i], short[(i + 1) % n])
-            if blend is not None:
-                parts.append(blend)
-    try:
-        joined = rg.Curve.JoinCurves(parts, max(_tol() * 8, 0.25), False)
-        got = [c for c in _as_list(joined) if c]
-    except Exception:
-        got = []
-    if not got:
-        return None
-    closed = [c for c in got if getattr(c, "IsClosed", False)]
-    if len(closed) == 1 and not _curve_self_intersects(closed[0]):
-        return closed[0]
-    if len(got) == 1:
-        crv = got[0]
-        if not crv.IsClosed:
-            try:
-                crv.MakeClosed(max(_tol() * 8, 0.25))
-            except Exception:
-                pass
-        if crv.IsValid and crv.IsClosed and not _curve_self_intersects(crv):
-            return crv
-    return None
-
-
-def _sample_at(curve, plane, ring, t):
-    pt = curve.PointAt(t)
-    xy = _to_xy(plane, pt)
-    tan = curve.TangentAt(t)
-    tan2 = _vunit((tan * plane.XAxis, tan * plane.YAxis))
-    inward = _vleft(tan2)
-    probe = _vadd(xy, _vmul(inward, 0.2))
-    if not _point_in_ring(probe, ring):
-        inward = _vmul(inward, -1.0)
-    return {
-        "point": xy,
-        "inward": inward,
-        "edge": _nearest_edge(xy, ring),
-        "t": t,
-    }
-
-
-def _eval_span(curve, plane, ring, t0, t1, count):
-    count = max(4, int(count))
-    ts = []
-    if t1 > t0:
-        ts = [t0 + (t1 - t0) * (i / float(count - 1)) for i in range(count)]
-    else:
-        domain = curve.Domain
-        a_steps = max(2, int(round((count - 1) * 0.5)))
-        b_steps = max(2, count - a_steps)
-        ts = [t0 + (domain.Max - t0) * (i / float(a_steps)) for i in range(a_steps)]
-        ts += [domain.Min + (t1 - domain.Min) * (i / float(b_steps - 1)) for i in range(b_steps)]
-    return [_sample_at(curve, plane, ring, t) for t in ts]
-
-
-def _offset_span_curve(curve, plane, ring, t0, t1, samples, deltas, min_width):
-    """Smooth offset of one thin parameter span. Endpoints stay on the original."""
-    span = _eval_span(curve, plane, ring, t0, t1, 48)
-    if len(span) < 4:
-        return None
-    local = [_value_at_t(samples, deltas, s["t"]) for s in span]
-    local[0] = 0.0
-    local[-1] = 0.0
-    pts = [_offset_point(span[i], local[i], ring) for i in range(len(span))]
-    pts[0] = span[0]["point"]
-    pts[-1] = span[-1]["point"]
-    shaped = _shape_thin_run(pts, local, ring, min_width, False)
-    if shaped:
-        shaped[0] = pts[0]
-        shaped[-1] = pts[-1]
-    return _interpolated_open(plane, shaped)
-
-
-def _rebuild_with_original(curve, plane, samples, deltas, ring, min_width):
-    """Keep original NURBS on wide spans; G2-blend grown pinches back in."""
-    if not HAS_RHINO or len(samples) < 4:
-        return None
-    thin = [d > 0.08 for d in deltas]
-    if not any(thin):
-        return curve.DuplicateCurve()
-    grown = list(thin)
-    n = len(samples)
-    for i in range(n):
-        if thin[i]:
-            grown[(i - 1 + n) % n] = True
-            grown[(i + 1) % n] = True
-    if all(grown):
-        return None
-    pieces = []
-    for start, end, is_thin in _ordered_runs(grown):
-        idxs = _run_indices(start, end, n)
-        if len(idxs) < 2:
-            continue
-        t0 = samples[idxs[0]]["t"]
-        t1 = samples[idxs[-1]]["t"]
-        if is_thin:
-            piece = _offset_span_curve(curve, plane, ring, t0, t1, samples, deltas, min_width)
-            if piece is None:
-                return None
-            pieces.append(piece)
-        else:
-            trimmed = _trim_span(curve, t0, t1)
-            if not trimmed:
-                return None
-            pieces.extend(trimmed)
-    if not pieces:
-        return None
-    return _g2_join_closed(pieces, max(min_width * 0.7, 1.5))
-
-
 _CLOSED_PREP = {}
 
 
@@ -1303,7 +1035,7 @@ def _clear_closed_prep():
 
 
 def _ensure_min_width(curve, min_width, corners):
-    """Parallel-offset the original curve only where it is thinner than min_width."""
+    """Offset each original node along its normal, scaled by distance from the pinch."""
     plane = _curve_plane(curve)
     try:
         length = curve.GetLength()
@@ -1321,19 +1053,22 @@ def _ensure_min_width(curve, min_width, corners):
         width_count = min(320, max(96, int(math.ceil(length / 1.0))))
         samples = _samples_from_curve(curve, plane, ring, width_count)
         spacing = length / float(max(len(samples), 1))
-        prep = (plane, ring, samples, spacing)
+        node_count = min(1200, max(240, int(math.ceil(length / 0.3))))
+        nodes = _samples_from_curve(curve, plane, ring, node_count)
+        prep = (plane, ring, samples, spacing, nodes)
         _CLOSED_PREP[key] = prep
-    plane, ring, samples, spacing = prep
+    plane, ring, samples, spacing, nodes = prep
     _assign_widths(samples, ring, min_width)
-    deltas, pinches = _compute_deltas(samples, spacing, min_width)
+    raw = _raw_deltas(samples, min_width)
+    if not any(d > 1e-4 for d in raw):
+        return [curve.DuplicateCurve()], 0, []
+    raw_nodes = [_value_at_t(samples, raw, node["t"]) for node in nodes]
+    deltas, pinches = _distance_scaled_deltas(nodes, raw_nodes, min_width)
     if pinches == 0:
         return [curve.DuplicateCurve()], 0, []
-    outline_curve = _rebuild_with_original(curve, plane, samples, deltas, ring, min_width)
-    if outline_curve is None:
-        moved, pinches = _apply_min_width(ring, samples, spacing, min_width, round_corners=False)
-        if pinches == 0:
-            return [curve.DuplicateCurve()], 0, []
-        outline_curve = _interpolated_closed(plane, moved)
+    moved = [_offset_point(nodes[i], deltas[i], ring) for i in range(len(nodes))]
+    moved = _remove_loops(_clean_ring(moved, 0.02))
+    outline_curve = _interpolated_closed(plane, moved)
     if outline_curve is None:
         return [curve.DuplicateCurve()], pinches, []
     if not outline_curve.IsClosed:
