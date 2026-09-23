@@ -178,17 +178,66 @@ function sampleBoundary(points: Point[], spacing: number): Omit<WidthSample, "wi
   return samples;
 }
 
-function localWidth(origin: Point, inward: Point, ring: Point[], skipEdge: number): number {
+function edgePrefix(ring: Point[]): number[] {
+  const pref = [0];
+  for (let i = 0; i < ring.length; i++) {
+    pref.push(pref[i] + dist(ring[i], ring[(i + 1) % ring.length]));
+  }
+  return pref;
+}
+
+function directedArc(prefix: number[], i: number, j: number): number {
+  const n = prefix.length - 1;
+  if (n <= 0 || i === j) return 0;
+  return i < j ? prefix[j] - prefix[i] : prefix[n] - prefix[i] + prefix[j];
+}
+
+function alongFromOrigin(
+  ring: Point[],
+  prefix: number[],
+  origin: Point,
+  skipEdge: number,
+  hitEdge: number,
+): number {
   const n = ring.length;
+  if (n <= 0) return 0;
+  const edgeLen = prefix[skipEdge + 1] - prefix[skipEdge];
+  let t = dist(ring[skipEdge], origin);
+  if (t > edgeLen) t = edgeLen;
+  const rem = edgeLen - t;
+  if (skipEdge === hitEdge) return Math.min(t, rem);
+  const fwd = rem + directedArc(prefix, (skipEdge + 1) % n, hitEdge);
+  const back = t + directedArc(prefix, (hitEdge + 1) % n, skipEdge);
+  return Math.min(fwd, back);
+}
+
+function localWidth(
+  origin: Point,
+  inward: Point,
+  ring: Point[],
+  skipEdge: number,
+  minWidth = 0,
+  prefix?: number[],
+): number {
+  const n = ring.length;
+  const pref = prefix ?? edgePrefix(ring);
+  const tangent = { x: inward.y, y: -inward.x };
+  const skipAlong = Math.max(minWidth * 2, 8);
   let best = Infinity;
   for (let i = 0; i < n; i++) {
     const wrap = Math.min(Math.abs(i - skipEdge), n - Math.abs(i - skipEdge));
     if (wrap <= 1) continue;
+    const hitTan = unit(sub(ring[(i + 1) % n], ring[i]));
+    const parallel = Math.abs(hitTan.x * tangent.x + hitTan.y * tangent.y) >= 0.82;
+    const nearby = alongFromOrigin(ring, pref, origin, skipEdge, i) < skipAlong;
+    if (nearby && !parallel) continue;
     const hit = raySegmentT(origin, inward, ring[i], ring[(i + 1) % n]);
     if (hit !== null && hit < best) best = hit;
     const close = closestOnSegment(origin, ring[i], ring[(i + 1) % n]);
     const gap = dist(origin, close);
     if (gap >= best || gap < 1e-4) continue;
+    const toClose = sub(close, origin);
+    if (Math.abs(toClose.x * tangent.x + toClose.y * tangent.y) > 0.85 * gap) continue;
     const mid = midpoint(origin, close);
     if (pointInPolygon(mid, ring) && gap < best) best = gap;
   }
@@ -256,9 +305,10 @@ export function ensureMinWidth(
   const perimeter = polylineLength(ring, true);
   const target = Math.min(0.4, Math.max(0.16, minWidth / 24));
   const spacing = perimeter > 720 * target ? perimeter / 720 : target;
+  const prefix = edgePrefix(ring);
   const samples: WidthSample[] = sampleBoundary(ring, spacing).map((s) => ({
     ...s,
-    width: localWidth(s.point, s.inward, ring, s.edge),
+    width: localWidth(s.point, s.inward, ring, s.edge, minWidth, prefix),
   }));
   if (samples.length < 3) return { outline: [ring], pinches: 0, centerlines: [] };
 

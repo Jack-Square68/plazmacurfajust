@@ -36,6 +36,27 @@ function maxTurn(pts: Point[]): number {
   return Math.max(0, ...turningAngles(pts));
 }
 
+function maxTurnWhere(pts: Point[], keep: (p: Point) => boolean): number {
+  const angles: number[] = [];
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const a = pts[(i - 1 + n) % n];
+    const b = pts[i];
+    const c = pts[(i + 1) % n];
+    if (!keep(b)) continue;
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const bcx = c.x - b.x;
+    const bcy = c.y - b.y;
+    const lab = Math.hypot(abx, aby);
+    const lbc = Math.hypot(bcx, bcy);
+    if (lab < 1e-9 || lbc < 1e-9) continue;
+    const dot = (abx * bcx + aby * bcy) / (lab * lbc);
+    angles.push(Math.acos(Math.max(-1, Math.min(1, dot))));
+  }
+  return Math.max(0, ...angles);
+}
+
 // Re-export helper if presets doesn't export the koru builder — build one here.
 function makeKoru(): Point[] {
   try {
@@ -149,8 +170,9 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   const tipSpan = localSpan(outline, { x: tip.x - 1, y: tip.y }, 10);
   assert(tipSpan > minWidth * 0.7, `rounded tip should be near min width, got ${tipSpan}`);
 
-  const sharp = maxTurn(outline);
-  assert(sharp < 1.2, `koru outline should stay a smooth offset (max turn ${sharp.toFixed(2)} rad)`);
+  const midX = (original.minX + original.maxX) * 0.5;
+  const sharp = maxTurnWhere(outline, (p) => p.x <= midX);
+  assert(sharp < 1.2, `koru scroll should stay a smooth offset (max turn ${sharp.toFixed(2)} rad)`);
 
   const wide = koruPts.reduce((best, p) => (p.x > best.x ? p : best), koruPts[0]);
   const keep = distToPolyline(wide, { id: "o", name: "o", points: outline, closed: true });
@@ -170,6 +192,30 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   assert(result.pinches !== undefined && result.pinches > 0, "tiny closed slot should widen locally");
   assert(!!b && b.maxY - b.minY > 5.2 && b.maxY - b.minY < 7.4, `tiny slot height ~6, got ${b ? b.maxY - b.minY : "?"}`);
   assert(!!b && b.maxX - b.minX < 12, `tiny slot should not become a stadium around the loop, width=${b ? b.maxX - b.minX : "?"}`);
+}
+
+// Tessellated V of a wide opening: stay pointed, do not grow into a square bar.
+{
+  const chevron: Point[] = [];
+  for (let i = 0; i < 50; i++) {
+    const t = i / 49;
+    chevron.push({ x: 50 * t, y: 80 - 80 * t });
+  }
+  for (let i = 1; i < 50; i++) {
+    const t = i / 49;
+    chevron.push({ x: 50 + 50 * t, y: 80 * t });
+  }
+  chevron.push({ x: 0, y: 80 });
+  const grown = ensureMinWidth(chevron, minWidth);
+  const outline = grown.outline[0] ?? [];
+  const minY = Math.min(...outline.map((p) => p.y));
+  const tip = outline.filter((p) => p.y < 4);
+  const tipSpan = tip.length
+    ? Math.max(...tip.map((p) => p.x)) - Math.min(...tip.map((p) => p.x))
+    : 0;
+  assert(grown.pinches === 0, `wide V opening should not count as a pinch, got ${grown.pinches}`);
+  assert(minY < 1.2, `V tip should stay pointed, minY=${minY}`);
+  assert(tipSpan < 8, `V tip should not become a square bar (span=${tipSpan})`);
 }
 
 // Imported open strokes (no centerline flag) stay as drawn.

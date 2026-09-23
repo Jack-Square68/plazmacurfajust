@@ -7,10 +7,11 @@ torch centerline. Enter bakes the result onto layers.
 
 Rhino 7 / 8
 -----------
-Closed openings are sampled once to a polyline (capped) for width, then
-the original curve is offset along its own normals and rebuilt as a
-degree-3 NURBS. Sharp corners get a simple wall-to-wall radius — they are not
-wrapped into a bulge around the original vertex. Rhino is not asked to CurveCurve /
+Closed openings are sampled once to a polyline (capped) for width. Already-wide
+walls keep the original NURBS. Only under-width pinches are offset along the
+original normals and joined back in. Pointed corners of a wide opening stay as
+drawn — they are not treated as thin slots. Sharp corners on a grown pinch get
+a simple wall-to-wall radius, not a bulge. Rhino is not asked to CurveCurve /
 GetLength / Contains on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
@@ -83,6 +84,10 @@ def _vunit(a):
 
 def _vcross(a, b):
     return a[0] * b[1] - a[1] * b[0]
+
+
+def _vdot(a, b):
+    return a[0] * b[0] + a[1] * b[1]
 
 
 def _vleft(tangent):
@@ -219,12 +224,62 @@ def _sample_boundary(ring, spacing):
     return samples
 
 
-def _local_width(origin, inward, ring, skip_edge):
+def _edge_prefix(ring):
     n = len(ring)
+    pref = [0.0] * (n + 1)
+    for i in range(n):
+        pref[i + 1] = pref[i] + _vdist(ring[i], ring[(i + 1) % n])
+    return pref
+
+
+def _directed_arc(prefix, i, j):
+    """Distance from start of edge i forward to start of edge j."""
+    n = len(prefix) - 1
+    if n <= 0 or i == j:
+        return 0.0
+    if i < j:
+        return prefix[j] - prefix[i]
+    return prefix[n] - prefix[i] + prefix[j]
+
+
+def _along_from_origin(ring, prefix, origin, skip_edge, hit_edge):
+    """Shorter along-boundary distance from a sample on skip_edge to hit_edge."""
+    n = len(ring)
+    if n <= 0:
+        return 0.0
+    edge_len = prefix[skip_edge + 1] - prefix[skip_edge]
+    t = _vdist(ring[skip_edge], origin)
+    if t > edge_len:
+        t = edge_len
+    rem = edge_len - t
+    if skip_edge == hit_edge:
+        return t if t < rem else rem
+    fwd = rem + _directed_arc(prefix, (skip_edge + 1) % n, hit_edge)
+    back = t + _directed_arc(prefix, (hit_edge + 1) % n, skip_edge)
+    return fwd if fwd < back else back
+
+
+def _local_width(origin, inward, ring, skip_edge, min_width=0.0, prefix=None):
+    """Distance to the opposite wall of a slot.
+
+    The other arm of a V / corner is nearby along the boundary and not
+    parallel — that is a corner, not a slot. A closest-point on this same
+    wall is along the tangent, not across the opening.
+    """
+    n = len(ring)
+    if prefix is None:
+        prefix = _edge_prefix(ring)
+    tangent = (inward[1], -inward[0])
+    skip_along = max(min_width * 2.0, 8.0)
     best = float("inf")
     for i in range(n):
         wrap = min(abs(i - skip_edge), n - abs(i - skip_edge))
         if wrap <= 1:
+            continue
+        hit_tan = _vunit(_vsub(ring[(i + 1) % n], ring[i]))
+        parallel = abs(_vdot(tangent, hit_tan)) >= 0.82
+        nearby = _along_from_origin(ring, prefix, origin, skip_edge, i) < skip_along
+        if nearby and not parallel:
             continue
         hit = _ray_seg_t(origin, inward, ring[i], ring[(i + 1) % n])
         if hit is not None and hit < best:
@@ -232,6 +287,9 @@ def _local_width(origin, inward, ring, skip_edge):
         close = _closest_on_seg(origin, ring[i], ring[(i + 1) % n])
         gap = _vdist(origin, close)
         if gap >= best or gap < 1e-4:
+            continue
+        # Same-wall closest points lie along the tangent, not across the opening.
+        if abs(_vdot(_vsub(close, origin), tangent)) > 0.85 * gap:
             continue
         mid = ((origin[0] + close[0]) * 0.5, (origin[1] + close[1]) * 0.5)
         if _point_in_ring(mid, ring) and gap < best:
@@ -259,20 +317,51 @@ def _smooth_closed_values(values, sigma):
     return out
 
 
-def _thin_runs(flags):
-    if not any(flags):
-        return 0
-    runs = 0
-    in_run = False
-    for flag in flags:
-        if flag and not in_run:
-            runs += 1
-            in_run = True
-        elif not flag:
-            in_run = False
-    if flags[0] and flags[-1] and runs >= 2:
-        runs -= 1
+def _flag_runs(flags):
+    """Inclusive (start, end) runs. A wrap-around run has start > end."""
+    n = len(flags)
+    if n == 0 or not any(flags):
+        return []
+    if all(flags):
+        return [(0, n - 1)]
+    runs = []
+    i = 0
+    while i < n:
+        if not flags[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and flags[j]:
+            j += 1
+        runs.append((i, j - 1))
+        i = j
+    if flags[0] and flags[-1] and len(runs) >= 2:
+        start = runs[-1][0]
+        end = runs[0][1]
+        runs = [(start, end)] + runs[1:-1]
     return runs
+
+
+def _run_indices(start, end, n):
+    if start <= end:
+        return list(range(start, end + 1))
+    return list(range(start, n)) + list(range(0, end + 1))
+
+
+def _suppress_short_runs(flags, min_len):
+    """Drop isolated 1–2 sample 'thin' flags; those are corner noise, not a slot."""
+    n = len(flags)
+    out = list(flags)
+    for start, end in _flag_runs(out):
+        idxs = _run_indices(start, end, n)
+        if len(idxs) < min_len:
+            for i in idxs:
+                out[i] = False
+    return out
+
+
+def _thin_runs(flags):
+    return len(_flag_runs(flags))
 
 
 def _exterior_arc(center, start, end, radius, ring):
@@ -421,10 +510,16 @@ def _simple_corner(a, b, c, radius, ring):
     return [p0] + _arc_points(center, p0, p1, r_used, ring) + [p1]
 
 
-def _fillet_offset_ring(points, radii, ring):
+def _fillet_offset_ring(points, radii, ring, closed=True):
     n = len(points)
     if n < 3:
         return points
+    if not closed:
+        out = [points[0]]
+        for i in range(1, n - 1):
+            out.extend(_simple_corner(points[i - 1], points[i], points[i + 1], radii[i], ring))
+        out.append(points[-1])
+        return _clean_ring(out, 0.02)
     out = []
     for i in range(n):
         a = points[(i - 1 + n) % n]
@@ -434,15 +529,83 @@ def _fillet_offset_ring(points, radii, ring):
     return _clean_ring(out, 0.02)
 
 
-def _prepare_ring(points):
+def _turn_at(a, b, c):
+    t1 = _vunit(_vsub(b, a))
+    t2 = _vunit(_vsub(c, b))
+    return math.atan2(_vcross(t1, t2), t1[0] * t2[0] + t1[1] * t2[1])
+
+
+def _round_short_ends(points, ring, min_width):
+    """Turn a blunt bar-end (two corners + short cap) into one semicircle."""
+    n = len(points)
+    if n < 8 or min_width <= 0:
+        return points
+    used = [False] * n
+    out = []
+    i = 0
+    while i < n:
+        if used[i]:
+            i += 1
+            continue
+        a = points[(i - 1 + n) % n]
+        b = points[i]
+        c = points[(i + 1) % n]
+        d = points[(i + 2) % n]
+        edge = _vdist(b, c)
+        prev_len = _vdist(a, b)
+        next_len = _vdist(c, d)
+        tb = _turn_at(a, b, c)
+        tc = _turn_at(b, c, d)
+        in_dir = _vunit(_vsub(b, a))
+        out_dir = _vunit(_vsub(d, c))
+        # A real blunt slot-end has opposite walls. A flattened V does not.
+        opposite_walls = _vdot(in_dir, out_dir) < -0.72
+        blunt = (
+            min_width * 0.3 < edge < min_width * 1.4
+            and prev_len > max(edge * 1.5, min_width * 0.8)
+            and next_len > max(edge * 1.5, min_width * 0.8)
+            and abs(tb) > 0.65
+            and abs(tc) > 0.65
+            and tb * tc > 0
+            and opposite_walls
+        )
+        if blunt and not used[(i + 1) % n]:
+            mid = ((b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5)
+            radius = max(edge * 0.5, 0.08)
+            out.append(b)
+            out.extend(_arc_points(mid, b, c, radius, ring))
+            out.append(c)
+            used[i] = True
+            used[(i + 1) % n] = True
+            i += 2
+            continue
+        out.append(b)
+        used[i] = True
+        i += 1
+    return _clean_ring(out, 0.02) if len(out) >= 3 else points
+
+
+def _assign_widths(samples, ring, min_width):
+    prefix = _edge_prefix(ring)
+    for sample in samples:
+        sample["width"] = _local_width(
+            sample["point"],
+            sample["inward"],
+            ring,
+            sample["edge"],
+            min_width,
+            prefix,
+        )
+
+
+def _prepare_ring(points, min_width=0.0):
     ring = _cap_ring(_ensure_ccw(_clean_ring(points)), MAX_SAMPLES)
     if len(ring) < 3:
         return (ring, [], 0.25)
     perimeter = _ring_length(ring)
     spacing = max(0.25, perimeter / float(MAX_SAMPLES))
     samples = _sample_boundary(ring, spacing)
-    for sample in samples:
-        sample["width"] = _local_width(sample["point"], sample["inward"], ring, sample["edge"])
+    _assign_widths(samples, ring, min_width)
     return (ring, samples, spacing)
 
 
@@ -459,23 +622,40 @@ def _nearest_edge(origin, ring):
     return best_i
 
 
+def _compute_deltas(samples, spacing, min_width):
+    """Per-sample outward grow. Isolated blips and leaked smoothing stay at 0."""
+    if len(samples) < 3 or min_width <= 0:
+        return [], 0
+    raw = []
+    for sample in samples:
+        width = sample.get("width", float("inf"))
+        if width == float("inf"):
+            raw.append(0.0)
+        else:
+            raw.append(max(0.0, (min_width - width) * 0.5))
+    flags = _suppress_short_runs([d > 0.04 for d in raw], 3)
+    for i in range(len(raw)):
+        if not flags[i]:
+            raw[i] = 0.0
+    if not any(d > 1e-4 for d in raw):
+        return [0.0] * len(samples), 0
+    sigma = max(1.2, (min_width * 0.55) / max(spacing, 1e-6))
+    deltas = _smooth_closed_values(raw, sigma)
+    for i in range(len(deltas)):
+        if deltas[i] <= 0.08:
+            deltas[i] = 0.0
+    pinches = _thin_runs([d > 0.08 for d in deltas])
+    return deltas, pinches
+
+
 def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
     if len(ring) < 3 or min_width <= 0:
         return (ring, 0)
     if len(samples) < 3:
         return (ring, 0)
-    raw = []
-    for sample in samples:
-        width = sample["width"]
-        if width == float("inf"):
-            raw.append(0.0)
-        else:
-            raw.append(max(0.0, (min_width - width) * 0.5))
-    if not any(d > 1e-4 for d in raw):
+    deltas, pinches = _compute_deltas(samples, spacing, min_width)
+    if pinches == 0:
         return (ring, 0)
-    sigma = max(1.2, (min_width * 0.55) / spacing)
-    deltas = _smooth_closed_values(raw, sigma)
-    pinches = _thin_runs([d > 0.04 for d in deltas])
     moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
     cleaned = _remove_loops(_clean_ring(moved, 0.02))
     n = len(cleaned)
@@ -489,6 +669,7 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
             )
             radii.append(max(deltas[nearest], 0.0))
         cleaned = _fillet_offset_ring(cleaned, radii, ring)
+        cleaned = _round_short_ends(cleaned, ring, min_width)
         cleaned = _remove_loops(cleaned)
     return (cleaned if len(cleaned) >= 3 else ring, pinches)
 
@@ -498,7 +679,7 @@ def ensure_min_width_ring(points, min_width):
 
     points: list of (x, y). Returns (moved_points, pinches).
     """
-    ring, samples, spacing = _prepare_ring(points)
+    ring, samples, spacing = _prepare_ring(points, min_width)
     return _apply_min_width(ring, samples, spacing, min_width)
 
 
@@ -743,12 +924,10 @@ def _samples_from_curve(curve, plane, ring, count):
         if not _point_in_ring(probe, ring):
             inward = _vmul(inward, -1.0)
         edge = _nearest_edge(xy, ring)
-        width = _local_width(xy, inward, ring, edge)
         samples.append({
             "point": xy,
             "inward": inward,
             "edge": edge,
-            "width": width,
             "t": t,
         })
     return samples
@@ -798,6 +977,118 @@ def _interpolated_closed(plane, ring):
     return _polyline_curve(plane, ring)
 
 
+def _interpolated_open(plane, pts):
+    if not HAS_RHINO or len(pts) < 2:
+        return None
+    rh_pts = [_from_xy(plane, p) for p in pts]
+    if len(pts) == 2:
+        try:
+            return rg.LineCurve(rh_pts[0], rh_pts[1])
+        except Exception:
+            return None
+    try:
+        crv = rg.Curve.CreateInterpolatedCurve(rh_pts, 3)
+        if crv is not None and crv.IsValid and not _curve_self_intersects(crv):
+            return crv
+    except Exception:
+        pass
+    try:
+        return rg.PolylineCurve(rh_pts)
+    except Exception:
+        return None
+
+
+def _trim_span(curve, t0, t1):
+    try:
+        if abs(t1 - t0) < 1e-9:
+            return []
+        if t1 > t0:
+            return [c for c in _as_list(curve.Trim(t0, t1)) if c]
+        domain = curve.Domain
+        a = _as_list(curve.Trim(t0, domain.Max))
+        b = _as_list(curve.Trim(domain.Min, t1))
+        return [c for c in a + b if c]
+    except Exception:
+        return []
+
+
+def _shape_thin_run(pts, deltas, ring, min_width, closed):
+    if len(pts) < 2:
+        return pts
+    cleaned = _clean_ring(pts, 0.02) if closed else list(pts)
+    if len(cleaned) < 2:
+        return pts
+    radii = []
+    for i in range(len(cleaned)):
+        nearest = min(range(len(pts)), key=lambda k: _vdist(cleaned[i], pts[k]))
+        radii.append(max(deltas[nearest], 0.0))
+    cleaned = _fillet_offset_ring(cleaned, radii, ring, closed)
+    if closed:
+        cleaned = _round_short_ends(cleaned, ring, min_width)
+        cleaned = _remove_loops(cleaned)
+    return cleaned if len(cleaned) >= 2 else pts
+
+
+def _reconstruct_from_original(curve, plane, samples, deltas, ring, min_width):
+    """Keep the original NURBS on wide spans; interpolate only the pinches."""
+    n = len(samples)
+    if n < 4 or not HAS_RHINO:
+        return None
+    thin = [d > 0.08 for d in deltas]
+    if not any(thin):
+        return curve.DuplicateCurve()
+    grown = list(thin)
+    for i in range(n):
+        if thin[i]:
+            grown[(i - 1 + n) % n] = True
+            grown[(i + 1) % n] = True
+    if all(grown):
+        return None
+    pieces = []
+    for start, end in _flag_runs(grown):
+        idxs = _run_indices(start, end, n)
+        pts = [_offset_point(samples[i], deltas[i], ring) for i in idxs]
+        run_deltas = [deltas[i] for i in idxs]
+        shaped = _shape_thin_run(pts, run_deltas, ring, min_width, closed=False)
+        piece = _interpolated_open(plane, shaped)
+        if piece is None:
+            return None
+        pieces.append(piece)
+    wide = [not flag for flag in grown]
+    for start, end in _flag_runs(wide):
+        idxs = _run_indices(start, end, n)
+        if len(idxs) < 2:
+            continue
+        t0 = samples[idxs[0]]["t"]
+        t1 = samples[idxs[-1]]["t"]
+        trimmed = _trim_span(curve, t0, t1)
+        if not trimmed:
+            return None
+        pieces.extend(trimmed)
+    if not pieces:
+        return None
+    try:
+        joined = rg.Curve.JoinCurves(pieces, max(_tol() * 8, 0.15), False)
+        got = [c for c in _as_list(joined) if c]
+    except Exception:
+        got = []
+    if not got:
+        got = pieces
+    closed = [c for c in got if getattr(c, "IsClosed", False)]
+    if len(closed) == 1 and not _curve_self_intersects(closed[0]):
+        return closed[0]
+    if len(got) == 1:
+        crv = got[0]
+        if not crv.IsClosed:
+            try:
+                crv.MakeClosed(_tol() * 8)
+            except Exception:
+                pass
+        if crv.IsValid and crv.IsClosed and not _curve_self_intersects(crv):
+            return crv
+    return None
+
+
 _CLOSED_PREP = {}
 
 
@@ -827,10 +1118,21 @@ def _ensure_min_width(curve, min_width, corners):
         prep = (plane, ring, samples, spacing)
         _CLOSED_PREP[key] = prep
     plane, ring, samples, spacing = prep
-    moved, pinches = _apply_min_width(ring, samples, spacing, min_width, round_corners=False)
+    _assign_widths(samples, ring, min_width)
+    deltas, pinches = _compute_deltas(samples, spacing, min_width)
     if pinches == 0:
         return [curve.DuplicateCurve()], 0, []
-    outline_curve = _interpolated_closed(plane, moved)
+    thin_count = sum(1 for d in deltas if d > 0.08)
+    outline_curve = None
+    if thin_count < int(0.8 * len(deltas)):
+        outline_curve = _reconstruct_from_original(
+            curve, plane, samples, deltas, ring, min_width
+        )
+    if outline_curve is None:
+        moved, pinches = _apply_min_width(ring, samples, spacing, min_width, round_corners=False)
+        if pinches == 0:
+            return [curve.DuplicateCurve()], 0, []
+        outline_curve = _interpolated_closed(plane, moved)
     if outline_curve is None:
         return [curve.DuplicateCurve()], pinches, []
     if not outline_curve.IsClosed:
@@ -1148,6 +1450,10 @@ def _self_test():
     assert_true(pinches > 0, "thin slot should pinch")
     assert_true(5.4 < height < 7.2, "thin slot height should be ~6, got {0}".format(height))
     assert_true(max(xs) - min(xs) > 79.0, "thin slot should keep its length")
+    assert_true(
+        max(xs) - min(xs) > 81.5,
+        "thin slot ends should be a single radius, not a flat bar ({0})".format(max(xs) - min(xs)),
+    )
 
     tiny = [(0.0, 0.0), (5.0, 0.0), (5.0, 1.0), (0.0, 1.0)]
     moved, pinches = ensure_min_width_ring(tiny, 6.0)
@@ -1165,7 +1471,7 @@ def _self_test():
         hairpin.append((0.5 + 0.5 * math.cos(a), 40.0 + 0.5 * math.sin(a)))
     for y in range(40, -1, -1):
         hairpin.append((1.0, float(y)))
-    ring, samples, spacing = _prepare_ring(hairpin)
+    ring, samples, spacing = _prepare_ring(hairpin, 6.0)
     moved, pinches = _apply_min_width(ring, samples, spacing, 6.0, round_corners=False)
     ys = [p[1] for p in moved]
     assert_true(pinches > 0, "hairpin tip should be under min width")
@@ -1181,6 +1487,42 @@ def _self_test():
     xs = [p[0] for p in moved]
     assert_true(pinches > 0, "thin elbow should widen")
     assert_true(max(xs) < 44.5, "elbow corner should be a simple radius, not a bulge (maxX={0})".format(max(xs)))
+
+    # Tessellated V of a wide opening: stay pointed, do not grow into a square bar.
+    chevron = []
+    for i in range(50):
+        t = i / 49.0
+        chevron.append((50.0 * t, 80.0 - 80.0 * t))
+    for i in range(1, 50):
+        t = i / 49.0
+        chevron.append((50.0 + 50.0 * t, 80.0 * t))
+    chevron.append((0.0, 80.0))
+    moved, pinches = ensure_min_width_ring(chevron, 6.0)
+    ys = [p[1] for p in moved]
+    tip = [p for p in moved if p[1] < 4.0]
+    tip_span = (max(p[0] for p in tip) - min(p[0] for p in tip)) if tip else 0.0
+    assert_true(pinches == 0, "wide V opening should not count as a pinch")
+    assert_true(min(ys) < 1.2, "V tip should stay pointed, minY={0}".format(min(ys)))
+    assert_true(tip_span < 8.0, "V tip should not become a square bar (span={0})".format(tip_span))
+
+    ellipse = []
+    for i in range(72):
+        a = (math.pi * 2.0 * i) / 72.0
+        ellipse.append((50.0 * math.cos(a), 30.0 * math.sin(a)))
+    moved, pinches = ensure_min_width_ring(ellipse, 6.0)
+    assert_true(pinches == 0, "wide ellipse should stay as drawn")
+    assert_true(max(p[0] for p in moved) < 51.0, "wide ellipse should not offset")
+
+    # Hourglass neck is not parallel walls, but it is a real pinch.
+    hourglass = [
+        (20.0, 8.0), (58.0, 8.0), (72.0, 22.0), (86.0, 8.0), (124.0, 8.0),
+        (124.0, 32.0), (86.0, 32.0), (72.0, 18.0), (58.0, 32.0), (20.0, 32.0),
+    ]
+    moved, pinches = ensure_min_width_ring(hourglass, 6.0)
+    neck = [p for p in moved if 64.0 < p[0] < 80.0]
+    neck_h = (max(p[1] for p in neck) - min(p[1] for p in neck)) if neck else 0.0
+    assert_true(pinches > 0, "hourglass neck should be under min width")
+    assert_true(neck_h > 5.2, "hourglass neck should grow toward 6 mm, got {0}".format(neck_h))
 
     print("PlasmaKerf math tests passed")
 
