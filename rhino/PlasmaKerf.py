@@ -8,8 +8,8 @@ torch centerline. Enter bakes the result onto layers.
 Rhino 7 / 8
 -----------
 Closed openings are sampled once to a polyline (capped) for width only.
-The baked outline is the original NURBS, offset as spans, with the same
-MinWidth/2 G2 fair blend on every tip — not a 1200-point interpolant.
+The baked outline is one closed periodic cubic through the offset walls —
+a few-node fair NURBS, never a 1200-point interpolant or grafted tip caps.
 Slot ends get a MinWidth/2 semicircle around the original tip. Pointed
 corners of a wide opening stay as drawn. Rhino is not asked to CurveCurve
 / GetLength / Contains on every sample, so a koru no longer locks the UI.
@@ -622,6 +622,15 @@ def _near_pinch(point, samples, grow, min_width):
     return False
 
 
+def _grow_at_point(point, samples, grow, default):
+    if not samples or not grow or point is None:
+        return default
+    best_i, _ = _nearest_index([s["point"] for s in samples], point)
+    if best_i < len(grow) and grow[best_i] > 0.04:
+        return grow[best_i]
+    return default
+
+
 def _cluster_original_turns(ring, min_width):
     """Group nearby same-sign turns so a tessellated CAD corner is one feature."""
     n = len(ring)
@@ -1197,14 +1206,18 @@ def _cap_all_tips_same(moved, tips, radius, ring):
 
 
 def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, min_width):
-    """Same min-width G2 fair blend on every tip, easing out of the offset walls."""
+    """Slot-end semicircles, plus a parallel round join on band corners.
+
+    Fillet radius is the wall grow — never MinWidth/2 on walls that only
+    moved a millimetre, which is what turned the triangle into lollipops.
+    """
     protected = []
     if len(moved) < 4 or min_width <= 0:
         return moved, protected
     radius = min_width * 0.5
     features = _original_features(feature_ring, samples, grow, min_width)
     for feat in features:
-        if feat["kind"] == "end":
+        if feat.get("kind") == "end":
             vertex = feat.get("center")
             chain = _end_cap_chain(feat["center"], feat["p0"], feat["p1"], radius, interior_ring)
             if len(chain) >= 2:
@@ -1212,18 +1225,26 @@ def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, 
                 if nxt is not moved and len(nxt) >= 3:
                     moved = nxt
                     protected.extend(chain)
-        else:
-            a = feat.get("a")
-            b = feat.get("b") or feat.get("center")
-            c = feat.get("c")
-            if a is None or b is None or c is None:
-                continue
-            chain = _fair_grown_corner(a, b, c, radius, radius, radius, interior_ring)
-            if len(chain) >= 2:
-                nxt = _splice_feature(moved, chain, b, radius)
-                if nxt is not moved and len(nxt) >= 3:
-                    moved = nxt
-                    protected.extend(chain)
+            continue
+        a = feat.get("a")
+        b = feat.get("b") or feat.get("center")
+        c = feat.get("c")
+        if a is None or b is None or c is None:
+            continue
+        turn = _turn_at(a, b, c)
+        # True band corner (the elbow). Skip hairpin transitions and sharp V tips.
+        if abs(turn) < 1.0 or abs(turn) > 2.2:
+            continue
+        join_r = min(
+            max(_grow_at_point(b, samples, grow, min_width * 0.25), 0.08),
+            radius,
+        )
+        chain = _vertex_round_join(a, b, c, join_r, interior_ring)
+        if len(chain) >= 2:
+            nxt = _splice_feature(moved, chain, b, join_r)
+            if nxt is not moved and len(nxt) >= 3:
+                moved = nxt
+                protected.extend(chain)
     cleaned = _clean_ring(moved, 0.02) if len(moved) >= 3 else moved
     return cleaned, protected
 
@@ -1419,6 +1440,350 @@ def _compute_deltas(samples, spacing, min_width):
     return _distance_scaled_deltas(samples, raw, min_width)
 
 
+def _solve_linear_nd(matrix, rhs):
+    """Gaussian elimination with partial pivoting. rhs is n x k."""
+    n = len(matrix)
+    if n == 0 or len(rhs) != n:
+        return None
+    k = len(rhs[0])
+    rows = []
+    for i in range(n):
+        rows.append([float(matrix[i][j]) for j in range(n)] + [float(rhs[i][c]) for c in range(k)])
+    for col in range(n):
+        pivot = col
+        best = abs(rows[col][col])
+        for r in range(col + 1, n):
+            val = abs(rows[r][col])
+            if val > best:
+                best = val
+                pivot = r
+        if best < 1e-14:
+            return None
+        if pivot != col:
+            rows[col], rows[pivot] = rows[pivot], rows[col]
+        scale = rows[col][col]
+        inv = 1.0 / scale
+        for c in range(col, n + k):
+            rows[col][c] *= inv
+        for r in range(n):
+            if r == col:
+                continue
+            fac = rows[r][col]
+            if abs(fac) < 1e-18:
+                continue
+            for c in range(col, n + k):
+                rows[r][c] -= fac * rows[col][c]
+    return [[rows[i][n + c] for c in range(k)] for i in range(n)]
+
+
+def _periodic_cubic_derivs(pts):
+    """C2 periodic cubic first derivatives (dS/dt, t = chord length)."""
+    n = len(pts)
+    if n < 3:
+        return None
+    h = []
+    for i in range(n):
+        d = _vdist(pts[i], pts[(i + 1) % n])
+        h.append(d if d > 1e-8 else 1e-8)
+    matrix = [[0.0] * n for _ in range(n)]
+    rhs = [[0.0, 0.0] for _ in range(n)]
+    for i in range(n):
+        im = (i - 1 + n) % n
+        ip = (i + 1) % n
+        hm = h[im]
+        hi = h[i]
+        matrix[i][im] = hm
+        matrix[i][i] = 2.0 * (hm + hi)
+        matrix[i][ip] = hi
+        dx0 = pts[i][0] - pts[im][0]
+        dy0 = pts[i][1] - pts[im][1]
+        dx1 = pts[ip][0] - pts[i][0]
+        dy1 = pts[ip][1] - pts[i][1]
+        rhs[i][0] = 3.0 * (dx1 * hm / hi + dx0 * hi / hm)
+        rhs[i][1] = 3.0 * (dy1 * hm / hi + dy0 * hi / hm)
+    return _solve_linear_nd(matrix, rhs)
+
+
+def _hermite_point(p0, p1, d0, d1, span, u):
+    u2 = u * u
+    u3 = u2 * u
+    h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+    h10 = u3 - 2.0 * u2 + u
+    h01 = -2.0 * u3 + 3.0 * u2
+    h11 = u3 - u2
+    return (
+        h00 * p0[0] + h10 * span * d0[0] + h01 * p1[0] + h11 * span * d1[0],
+        h00 * p0[1] + h10 * span * d0[1] + h01 * p1[1] + h11 * span * d1[1],
+    )
+
+
+def _sample_periodic_cubic(pts, spacing=0.35):
+    """Evaluate a closed C2 cubic interpolant. Output is a dense polyline."""
+    if len(pts) < 3:
+        return list(pts)
+    derivs = _periodic_cubic_derivs(pts)
+    if derivs is None:
+        return list(pts)
+    n = len(pts)
+    out = []
+    for i in range(n):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % n]
+        d0 = derivs[i]
+        d1 = derivs[(i + 1) % n]
+        span = _vdist(p0, p1)
+        if span < 1e-10:
+            continue
+        steps = max(2, int(math.ceil(span / max(spacing, 0.08))))
+        for s in range(steps):
+            out.append(_hermite_point(p0, p1, d0, d1, span, s / float(steps)))
+    cleaned = _clean_ring(out, min(spacing * 0.25, 0.05))
+    return cleaned if len(cleaned) >= 3 else list(pts)
+
+
+def _arc_length_resample(points, count, closed=True):
+    """Evenly spaced samples along a (closed) polyline, few enough to stay fair."""
+    if len(points) < 2 or count < 3:
+        return list(points)
+    n = len(points)
+    segs = n if closed else (n - 1)
+    lengths = []
+    total = 0.0
+    for i in range(segs):
+        d = _vdist(points[i], points[(i + 1) % n])
+        lengths.append(d)
+        total += d
+    if total < 1e-9:
+        return list(points)
+    out = []
+    denom = float(count) if closed else float(count - 1)
+    for k in range(count):
+        target = total * (k / denom)
+        acc = 0.0
+        chosen = points[0]
+        for i in range(segs):
+            seg = lengths[i]
+            if acc + seg >= target - 1e-12 or i == segs - 1:
+                t = 0.0 if seg < 1e-12 else (target - acc) / seg
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                a = points[i]
+                b = points[(i + 1) % n]
+                chosen = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+                break
+            acc += seg
+        out.append(chosen)
+    return _clean_ring(out, 1e-6) if closed else out
+
+
+def _drop_near_tips(points, tips, omit):
+    """Keep wall samples; drop the miter / house vertices at sharp tips."""
+    if not points or not tips or omit <= 0.0:
+        return list(points)
+    kept = []
+    for p in points:
+        near = False
+        for tip in tips:
+            if tip is None:
+                continue
+            if _vdist(p, tip) < omit:
+                near = True
+                break
+        if not near:
+            kept.append(p)
+    if len(kept) < 6:
+        return list(points)
+    return kept
+
+
+def _fair_ctrl_count(n_tips):
+    return min(64, max(24, max(int(n_tips), 1) * 8))
+
+
+def _bspline_cubic_point(cvs, u):
+    """Uniform periodic cubic B-spline. u in [0, n)."""
+    n = len(cvs)
+    if n < 3:
+        return cvs[0] if cvs else (0.0, 0.0)
+    while u < 0.0:
+        u += float(n)
+    i = int(math.floor(u)) % n
+    t = u - math.floor(u)
+    t2 = t * t
+    t3 = t2 * t
+    b0 = (1.0 - t) ** 3 / 6.0
+    b1 = (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0
+    b2 = (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0
+    b3 = t3 / 6.0
+    p0 = cvs[(i - 1 + n) % n]
+    p1 = cvs[i]
+    p2 = cvs[(i + 1) % n]
+    p3 = cvs[(i + 2) % n]
+    return (
+        b0 * p0[0] + b1 * p1[0] + b2 * p2[0] + b3 * p3[0],
+        b0 * p0[1] + b1 * p1[1] + b2 * p2[1] + b3 * p3[1],
+    )
+
+
+def _sample_periodic_bspline(cvs, spacing=0.35):
+    """Dense polyline of a closed cubic B-spline — one fair curve, few CVs."""
+    n = len(cvs)
+    if n < 4:
+        return list(cvs)
+    perim = 0.0
+    for i in range(n):
+        perim += _vdist(cvs[i], cvs[(i + 1) % n])
+    steps = max(n * 8, int(math.ceil(perim / max(spacing, 0.08))))
+    out = [_bspline_cubic_point(cvs, n * s / float(steps)) for s in range(steps)]
+    cleaned = _clean_ring(out, min(spacing * 0.25, 0.05))
+    return cleaned if len(cleaned) >= 4 else list(cvs)
+
+
+def _offset_miter(a, b, c, distance, ring):
+    """Intersection of the two walls offset by `distance` — outside the tip."""
+    if a is None or b is None or c is None or distance <= 1e-9:
+        return None
+    out1 = _wall_outward(a, b, ring)
+    out2 = _wall_outward(b, c, ring)
+    if (out1[0] == 0.0 and out1[1] == 0.0) or (out2[0] == 0.0 and out2[1] == 0.0):
+        return None
+    g1a = _vadd(a, _vmul(out1, distance))
+    g1b = _vadd(b, _vmul(out1, distance))
+    g2b = _vadd(b, _vmul(out2, distance))
+    g2c = _vadd(c, _vmul(out2, distance))
+    corner = _line_intersect_unbounded(g1a, g1b, g2b, g2c)
+    if corner is None:
+        bis = _vunit(_vadd(out1, out2))
+        if bis[0] == 0.0 and bis[1] == 0.0:
+            return None
+        corner = _vadd(b, _vmul(bis, distance))
+    # Must sit outside the original opening, otherwise the spline cuts the tip.
+    if _point_in_ring(corner, ring):
+        bis = _vunit(_vsub(b, corner))
+        if bis[0] == 0.0 and bis[1] == 0.0:
+            return None
+        corner = _vadd(b, _vmul(bis, max(distance, 0.4)))
+    return corner
+
+
+def _fair_controls(offset, features, samples, grow, interior, min_width):
+    """Few wall CVs plus one outside miter CV at each fillet tip."""
+    feats = []
+    for feat in features or []:
+        if feat.get("kind") != "fillet":
+            continue
+        tip = feat.get("b") or feat.get("center")
+        if tip is None:
+            continue
+        feats.append(feat)
+    tips = [f.get("b") or f.get("center") for f in feats]
+    if len(offset) < 6:
+        return None
+    if not tips:
+        return _arc_length_resample(offset, _fair_ctrl_count(0), True)
+
+    omit = max(min_width * 0.45, 2.0)
+    n = len(offset)
+    near = []
+    for p in offset:
+        flag = False
+        for tip in tips:
+            if _vdist(p, tip) < omit:
+                flag = True
+                break
+        near.append(flag)
+    if all(near) or not any(near):
+        return _arc_length_resample(offset, _fair_ctrl_count(len(tips)), True)
+
+    start = 0
+    while start < n and near[start]:
+        start += 1
+    if start >= n:
+        return _arc_length_resample(offset, _fair_ctrl_count(len(tips)), True)
+    guard = 0
+    while not near[(start - 1 + n) % n] and guard < n:
+        start = (start - 1 + n) % n
+        guard += 1
+        if start == 0 and not near[n - 1]:
+            break
+
+    walls = []
+    miters = []
+    cur = []
+    for k in range(n):
+        i = (start + k) % n
+        if not near[i]:
+            cur.append(offset[i])
+            continue
+        if not cur:
+            continue
+        tip = min(tips, key=lambda t: _vdist(offset[i], t))
+        feat = None
+        for cand in feats:
+            tb = cand.get("b") or cand.get("center")
+            if tb is not None and _vdist(tb, tip) < 1e-6:
+                feat = cand
+                break
+        dist = _grow_at_point(tip, samples, grow, min_width * 0.25)
+        dist = max(dist, min_width * 0.2)
+        tip_cvs = None
+        if feat is not None:
+            chain = _vertex_round_join(feat.get("a"), tip, feat.get("c"), dist, interior)
+            if chain and len(chain) >= 2:
+                tip_cvs = _arc_length_resample(chain, 5, False)
+            if not tip_cvs:
+                miter = _offset_miter(feat.get("a"), tip, feat.get("c"), dist, interior)
+                tip_cvs = [miter] if miter is not None else None
+        if not tip_cvs:
+            bis = _vunit(_vsub(tip, cur[-1])) if cur else (0.0, 0.0)
+            tip_cvs = [_vadd(tip, _vmul(bis, dist))] if bis[0] or bis[1] else None
+        walls.append(cur)
+        miters.append(tip_cvs)
+        cur = []
+    if cur:
+        if walls:
+            walls[0] = cur + walls[0]
+        else:
+            walls.append(cur)
+            miters.append(None)
+
+    if len(walls) < 2:
+        return _arc_length_resample(offset, _fair_ctrl_count(len(tips)), True)
+
+    per = 7
+    ctrl = []
+    for wall, tip_cvs in zip(walls, miters):
+        if len(wall) >= 2:
+            ctrl.extend(_arc_length_resample(wall, per, False))
+        elif wall:
+            ctrl.append(wall[0])
+        if tip_cvs:
+            ctrl.extend(tip_cvs)
+    ctrl = _clean_ring(ctrl, 0.05)
+    return ctrl if len(ctrl) >= 6 else None
+
+
+def _fair_curve_from_offset(offset, tips, min_width, features=None, samples=None, grow=None, interior=None):
+    """One closed periodic cubic through the offset walls — no grafted caps."""
+    if len(offset) < 6:
+        return None
+    interior = interior if interior is not None else offset
+    ctrl = _fair_controls(offset, features, samples, grow, interior, min_width)
+    if ctrl is None or len(ctrl) < 6:
+        kept = _drop_near_tips(offset, tips, max(min_width * 0.45, 2.0))
+        ctrl = _arc_length_resample(kept if len(kept) >= 6 else offset, _fair_ctrl_count(len(tips) if tips else 0), True)
+    if ctrl is None or len(ctrl) < 6:
+        return None
+    sampled = _sample_periodic_bspline(ctrl, 0.35)
+    if len(sampled) < 6 or _polyline_self_intersects(sampled):
+        sampled = _sample_periodic_cubic(ctrl, 0.35)
+    if len(sampled) < 3 or _polyline_self_intersects(sampled):
+        return None
+    return sampled
+
+
 def _uniform_outward_offset(ring, distance, interior):
     """Parallel of the original ring — keeps the same fairness as the input walls."""
     n = len(ring)
@@ -1439,20 +1804,31 @@ def _uniform_outward_offset(ring, distance, interior):
     return _clean_ring(out, 0.02) if len(out) >= 3 else out
 
 
-def _rebuild_fair_opening(ring, features, min_width, interior):
-    """Parallel offset of the original, then the same G2 tip on every corner."""
-    radius = min_width * 0.5
-    offset = _uniform_outward_offset(ring, radius, interior)
+def _rebuild_fair_opening(ring, features, min_width, interior, distance=None):
+    """Uniform parallel of the walls, then one periodic cubic through those walls."""
+    if distance is None or distance <= 1e-9:
+        distance = min_width * 0.5
+    offset = _uniform_outward_offset(ring, distance, interior)
     if len(offset) < 6:
         return None
     tips = [f.get("b") or f.get("center") for f in features if f.get("kind") == "fillet"]
     tips = [t for t in tips if t is not None]
-    if len(tips) < 2:
-        return None
-    moved, _ = _cap_all_tips_same(offset, tips, radius, interior)
-    if len(moved) < 3 or _polyline_self_intersects(moved):
-        return None
-    return moved
+    grow = [distance] * max(len(offset), 1)
+    fake_samples = [{"point": p} for p in offset]
+    return _fair_curve_from_offset(
+        offset, tips, min_width, features, fake_samples, grow, interior
+    )
+
+
+def _fillet_tips(features):
+    tips = []
+    for feat in features or []:
+        if feat.get("kind") != "fillet":
+            continue
+        tip = feat.get("b") or feat.get("center")
+        if tip is not None:
+            tips.append(tip)
+    return tips
 
 
 def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
@@ -1465,16 +1841,32 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
         return (ring, 0)
     raw = _raw_deltas(samples, min_width)
     features = _original_features(ring, samples, deltas, min_width)
+    tips = _fillet_tips(features)
     if (
         _mostly_thin(raw)
-        and features
+        and tips
         and all(f.get("kind") == "fillet" for f in features)
     ):
-        rebuilt = _rebuild_fair_opening(ring, features, min_width, ring)
+        rebuilt = _rebuild_fair_opening(
+            ring, features, min_width, ring, _median_positive(raw)
+        )
         if rebuilt is not None:
             return (rebuilt, pinches)
     moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
     cleaned = _remove_loops(_clean_ring(moved, 0.02))
+    # Only rebuild the whole outline when every pinch feature is a fillet.
+    # Mixed slot-ends + a corner (hairpin, elbow) keep their end caps.
+    if (
+        len(cleaned) >= 3
+        and tips
+        and features
+        and all(f.get("kind") == "fillet" for f in features)
+    ):
+        faired = _fair_curve_from_offset(
+            cleaned, tips, min_width, features, samples, deltas, ring
+        )
+        if faired is not None:
+            cleaned = faired
     if len(cleaned) >= 3:
         cleaned, protected = _apply_original_features(
             cleaned, ring, ring, samples, deltas, min_width
@@ -2095,6 +2487,45 @@ def _nurbs_from_xy_controls(plane, cvs, degree=5):
     return None
 
 
+def _nurbs_periodic_from_ring(plane, ring, n_ctrl):
+    """Few-node periodic cubic of a fair ring — never a 1200-point interpolant."""
+    if plane is None or len(ring) < 6:
+        return None
+    ctrl = _arc_length_resample(ring, max(6, int(n_ctrl)), True)
+    if len(ctrl) < 6:
+        return None
+    pts = [_from_xy(plane, p) for p in ctrl]
+    styles = []
+    try:
+        styles.append(rg.CurveKnotStyle.ChordPeriodic)
+    except Exception:
+        pass
+    try:
+        styles.append(rg.CurveKnotStyle.Chord)
+    except Exception:
+        pass
+    for style in styles:
+        try:
+            crv = rg.Curve.CreateInterpolatedCurve(pts, 3, style)
+        except Exception:
+            crv = None
+        if crv is None or not getattr(crv, "IsValid", False):
+            continue
+        crv = _force_closed_curve(crv)
+        if crv is not None and crv.IsValid and not _curve_self_intersects(crv):
+            return crv
+    try:
+        crv = rg.NurbsCurve.Create(True, 3, pts)
+    except Exception:
+        crv = None
+    if crv is None or not getattr(crv, "IsValid", False):
+        return None
+    crv = _force_closed_curve(crv)
+    if crv is None or not crv.IsValid or _curve_self_intersects(crv):
+        return None
+    return crv
+
+
 def _fair_blend_between(a, b, radius, plane, ring):
     """G2 fair blend between two offset walls. Few-CV NURBS, never an interpolant."""
     if a is None or b is None or radius < _tol():
@@ -2507,7 +2938,7 @@ def _clear_closed_prep():
 
 
 def _ensure_min_width(curve, min_width, corners):
-    """Widen under-min-width stretches; keep the original NURBS + same-radius tips."""
+    """Widen under-min-width stretches into one fair few-node closed curve."""
     plane = _curve_plane(curve)
     try:
         length = curve.GetLength()
@@ -2539,23 +2970,29 @@ def _ensure_min_width(curve, min_width, corners):
     feature_ring = corners_xy if len(corners_xy) >= 3 else ring
     features = _original_features(feature_ring, samples, deltas, min_width)
     radius = min_width * 0.5
-    distance = _median_positive(raw)
+    tips = _fillet_tips(features)
+    has_end = any(f.get("kind") == "end" for f in features)
 
     outline = None
-    if _mostly_thin(raw) or _grow_is_uniform(raw):
-        outline = _nurbs_same_tip_caps(curve, distance, radius, plane, ring, features)
-        if outline is None:
-            grown = _grow_opening(curve, distance, "Sharp")
-            if grown is not None:
-                outline = _nurbs_same_tip_caps(grown, 0.0, radius, plane, ring, features)
-                if outline is None:
-                    outline = grown
-    else:
+    # Keep the artist's few CVs when there is no sharp tip to rebuild.
+    try:
+        orig_nurbs = curve.ToNurbsCurve()
+        orig_cvs = orig_nurbs.Points.Count if orig_nurbs is not None else 0
+    except Exception:
+        orig_cvs = 0
+    if not tips and orig_cvs and orig_cvs <= 48 and not _mostly_thin(raw):
         moved = _move_nurbs_cvs(curve, plane, samples, deltas, ring)
         if moved is not None:
-            outline = _nurbs_same_tip_caps(moved, 0.0, radius, plane, ring, features)
-            if outline is None:
+            if has_end:
+                capped = _nurbs_same_tip_caps(moved, 0.0, radius, plane, ring, features)
+                outline = capped if capped is not None else moved
+            else:
                 outline = moved
+
+    if outline is None:
+        moved_ring, _ = _apply_min_width(ring, samples, spacing, min_width)
+        n_ctrl = _fair_ctrl_count(len(tips) if tips else 3)
+        outline = _nurbs_periodic_from_ring(plane, moved_ring, n_ctrl)
 
     if outline is None or not getattr(outline, "IsValid", False):
         # Last resort: keep the original NURBS. Never emit a dense interpolant.
@@ -3036,7 +3473,50 @@ def _self_test():
         assert_true(extent > 0.35, "triangle corner must not stay a sharp point (ext={0})".format(extent))
     assert_true(
         max(extents) - min(extents) < 2.0,
-        "all three triangle corners should close with the same fair blend (ext={0})".format(extents),
+        "all three triangle corners should close the same way (ext={0})".format(extents),
+    )
+    # Wide sides stay on the original — a grafted r=3 bulb / uniform offset would
+    # shove the mid-side out by about 3 mm.
+    for a, b in [((0.0, 0.0), (80.0, 0.0)), ((80.0, 0.0), (40.0, 70.0)), ((40.0, 70.0), (0.0, 0.0))]:
+        mid = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+        inward = _vunit(_vsub(centroid, mid))
+        ctrl = _vadd(mid, _vmul(inward, 8.0))
+        orig_mid = (
+            0.25 * a[0] + 0.5 * ctrl[0] + 0.25 * b[0],
+            0.25 * a[1] + 0.5 * ctrl[1] + 0.25 * b[1],
+        )
+        nearest = min(_vdist(p, orig_mid) for p in moved)
+        assert_true(
+            nearest < 1.6,
+            "triangle side should stay on the original, not take a 3 mm bulb (d={0})".format(nearest),
+        )
+    kappas = []
+    for i in range(len(moved)):
+        turn = _turn_at(moved[(i - 1) % len(moved)], moved[i], moved[(i + 1) % len(moved)])
+        ds = 0.5 * (
+            _vdist(moved[(i - 1) % len(moved)], moved[i])
+            + _vdist(moved[i], moved[(i + 1) % len(moved)])
+        )
+        if ds > 1e-6:
+            kappas.append(turn / ds)
+    # Grafted r = 3 caps are a flat κ ≈ 1/3 pulse. A fair tip eases through.
+    circle_k = 1.0 / 3.0
+    near_circle = [
+        abs(abs(k) - circle_k) < 0.06
+        for k in kappas
+    ]
+    circle_run = 0
+    best_run = 0
+    for flag in near_circle + near_circle[:2]:
+        if flag:
+            circle_run += 1
+            if circle_run > best_run:
+                best_run = circle_run
+        else:
+            circle_run = 0
+    assert_true(
+        best_run < 8,
+        "triangle tips must not be grafted min-width circles (circle-run={0})".format(best_run),
     )
 
     # Same G2 fair blend on every tip — tangent to both walls, curvature eases in.

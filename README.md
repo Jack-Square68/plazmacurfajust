@@ -47,7 +47,7 @@ Nearly-closed paths auto-close. Open strokes from a file are left as drawn — t
 
 Copy this file again after updates — Rhino keeps using the path you last ran.
 
-Closed openings measure width on a capped polyline (so Rhino stays live). The baked outline keeps the **original NURBS** (few edit points): each wall is offset as a span, then every tip is closed with the **same Min width / 2** G2 fair blend so the outline stays one flowing curve. Slot ends get a **Min width / 2** semicircle around the original tip. Pointed corners of a wide opening stay as drawn. The result is never rebuilt as a dense interpolant. That is what stopped the old script from locking Rhino on a koru: it used to fire `GetLength` / `Contains` on the NURBS for every sample.
+Closed openings measure width on a capped polyline (so Rhino stays live). The baked outline is **one closed periodic cubic** through the offset walls (few edit points) — a slightly larger, smoother version of the original curve, not walls with grafted circular / G2 caps. Slot ends of a thin parallel opening still get a **Min width / 2** semicircle around the original tip. Pointed corners of a wide opening stay as drawn. The result is never rebuilt as a dense interpolant. That is what stopped the old script from locking Rhino on a koru: it used to fire `GetLength` / `Contains` on the NURBS for every sample.
 
 Rhino 8 also works from **ScriptEditor**: open the file and Run.
 
