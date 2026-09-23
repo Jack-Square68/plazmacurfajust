@@ -47,7 +47,7 @@ Nearly-closed paths auto-close. Open strokes from a file are left as drawn — t
 
 Copy this file again after updates — Rhino keeps using the path you last ran.
 
-Closed openings measure width on a capped polyline (so Rhino stays live). Already-wide walls stay on the original curve; only under-width pinches move out along the original normals. The finished outline is **one closed NURBS**, not trimmed pieces joined with kinks. Pointed corners of a wide opening stay as drawn. That is what stopped the old script from locking Rhino on a koru: it used to fire `GetLength` / `Contains` on the NURBS for every sample.
+Closed openings measure width on a capped polyline (so Rhino stays live). Already-wide walls **keep the original NURBS** (a circular band stays circular). Only under-width pinches move out and are blended back with curvature continuity. Pointed corners of a wide opening stay as drawn. That is what stopped the old script from locking Rhino on a koru: it used to fire `GetLength` / `Contains` on the NURBS for every sample.
 
 Rhino 8 also works from **ScriptEditor**: open the file and Run.
 
