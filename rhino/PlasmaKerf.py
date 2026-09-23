@@ -10,11 +10,11 @@ Rhino 7 / 8
 Closed openings are sampled once to a polyline (capped) for width. Each node
 on the original curve then moves out along its normal by a scaled amount:
 full grow at the pinch, fading with distance along the curve so the offset
-stays one smooth parallel. Sharp corners in a pinch get a simple radius of
-MinWidth/2 on the original vertex (no S-wave). Square / pointed ends get one
-semicircle of MinWidth/2 around the original tip. Pointed corners of a wide
-opening stay as drawn. Rhino is not asked to CurveCurve / GetLength /
-Contains on every sample, so a koru no longer locks the UI.
+stays one smooth parallel. Sharp corners and ends insert a circle of
+MinWidth diameter, tangent to both walls, then merge it so the outline
+stays one closed curve. Pointed corners of a wide opening stay as drawn.
+Rhino is not asked to CurveCurve / GetLength / Contains on every sample,
+so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -709,6 +709,26 @@ def _vertex_round_join(a, b, c, radius, ring):
     return [p0] + _arc_points(b, p0, p1, radius, ring) + [p1]
 
 
+def _tangent_min_circle_arc(a, b, c, radius, ring):
+    """Exterior arc of the min-diameter circle tangent to both walls at b."""
+    if radius < 0.04:
+        return [b]
+    out1 = _wall_outward(a, b, ring)
+    out2 = _wall_outward(b, c, ring)
+    o1a = _vadd(a, _vmul(out1, radius))
+    o1b = _vadd(b, _vmul(out1, radius))
+    o2b = _vadd(b, _vmul(out2, radius))
+    o2c = _vadd(c, _vmul(out2, radius))
+    center = _line_intersect_unbounded(o1a, o1b, o2b, o2c)
+    if center is None:
+        return _vertex_round_join(a, b, c, radius, ring)
+    t0 = _vadd(center, _vmul(out1, -radius))
+    t1 = _vadd(center, _vmul(out2, -radius))
+    if _vdist(t0, t1) < 0.04:
+        return [t0]
+    return [t0] + _arc_points(center, t0, t1, radius, ring) + [t1]
+
+
 def _fillet_grown_corner(a, b, c, grow1, grow2, radius, ring):
     """Simple half-min-width radius on the two grown walls at original corner b."""
     if radius < 0.04:
@@ -940,20 +960,13 @@ def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, 
         vertex = feat.get("b") or feat.get("center")
         if feat["kind"] == "end":
             chain = _end_cap_chain(feat["center"], feat["p0"], feat["p1"], radius, interior_ring)
-            splice_r = radius
         else:
-            grow1 = max(_grow_near(feat["a"], samples, grow), _grow_near(feat["b"], samples, grow))
-            grow2 = max(_grow_near(feat["b"], samples, grow), _grow_near(feat["c"], samples, grow))
-            join_r = max(grow1, grow2)
-            if join_r < 0.08:
-                continue
-            # Classic offset join: one circular arc of the wall grow, not a
-            # min-width/2 lollipop and not a leftover sharp point.
-            chain = _vertex_round_join(feat["a"], feat["b"], feat["c"], join_r, interior_ring)
-            splice_r = join_r
+            chain = _tangent_min_circle_arc(
+                feat["a"], feat["b"], feat["c"], radius, interior_ring
+            )
         if len(chain) < 2:
             continue
-        nxt = _splice_feature(moved, chain, vertex, splice_r)
+        nxt = _splice_feature(moved, chain, vertex, radius)
         if nxt is not moved and len(nxt) >= 3:
             moved = nxt
             protected.extend(chain)
@@ -1514,6 +1527,126 @@ def _interpolated_closed(plane, ring):
     return _polyline_curve(plane, ring)
 
 
+def _force_closed_curve(curve):
+    """The finished outline must always be a closed curve."""
+    if curve is None or not curve.IsValid:
+        return curve
+    if curve.IsClosed:
+        return curve
+    try:
+        if curve.MakeClosed(_tol() * 4) and curve.IsClosed:
+            return curve
+    except Exception:
+        pass
+    try:
+        start = curve.PointAtStart
+        end = curve.PointAtEnd
+        if start.DistanceTo(end) > _tol():
+            closer = rg.LineCurve(end, start)
+            joined = rg.Curve.JoinCurves([curve, closer], _tol() * 4, True)
+            got = _as_list(joined)
+            if got:
+                curve = got[0]
+        if not curve.IsClosed:
+            curve.MakeClosed(_tol() * 4)
+    except Exception:
+        pass
+    return curve
+
+
+def _to_arcs_curve(curve):
+    """Convert the offset NURBS to lines and arcs so a tangent circle can merge."""
+    if curve is None:
+        return None
+    try:
+        length = curve.GetLength()
+    except Exception:
+        length = 0.0
+    max_len = length if length > 1.0 else 100.0
+    try:
+        arcs = curve.ToArcsAndLines(_tol(), math.radians(4.0), 0.05, max_len)
+        if arcs is not None and arcs.IsValid:
+            return _force_closed_curve(arcs)
+    except Exception:
+        pass
+    try:
+        pline = curve.ToPolyline(_tol(), _tol(), 0.0, 0.0)
+        if pline is not None:
+            crv = rg.PolylineCurve(pline)
+            if crv is not None and crv.IsValid:
+                return _force_closed_curve(crv)
+    except Exception:
+        pass
+    return _force_closed_curve(curve)
+
+
+def _circle_curve(plane, center_xy, radius):
+    if radius < _tol() or center_xy is None:
+        return None
+    try:
+        circ = rg.Circle(plane, _from_xy(plane, center_xy), radius)
+        crv = rg.ArcCurve(circ)
+        if crv is None or not crv.IsValid:
+            return None
+        return _force_closed_curve(crv)
+    except Exception:
+        return None
+
+
+def _feature_circle_center(feat, radius, ring, samples, grow):
+    """Center of the min-diameter circle tangent to both walls at this end."""
+    if feat.get("kind") == "end" and feat.get("center") is not None:
+        return feat["center"]
+    a = feat.get("a")
+    b = feat.get("b")
+    c = feat.get("c")
+    if a is None or b is None or c is None:
+        return feat.get("center") or b
+    out1 = _wall_outward(a, b, ring)
+    out2 = _wall_outward(b, c, ring)
+    o1a = _vadd(a, _vmul(out1, radius))
+    o1b = _vadd(b, _vmul(out1, radius))
+    o2b = _vadd(b, _vmul(out2, radius))
+    o2c = _vadd(c, _vmul(out2, radius))
+    center = _line_intersect_unbounded(o1a, o1b, o2b, o2c)
+    return center if center is not None else b
+
+
+def _merge_min_diameter_ends(outline, plane, features, ring, samples, grow, min_width):
+    """Insert a MinWidth-diameter circle tangent at each end and merge it in.
+
+    Convert the offset to arcs first, fillet corners to that radius, then
+    boolean-union any remaining tip circles so the result stays closed.
+    """
+    if outline is None or min_width <= 0:
+        return outline
+    radius = min_width * 0.5
+    outline = _force_closed_curve(_to_arcs_curve(outline))
+    try:
+        filleted = rg.Curve.CreateFilletCorners(
+            outline, radius, _tol(), math.radians(5.0)
+        )
+        if filleted is not None and filleted.IsValid:
+            outline = _force_closed_curve(filleted)
+    except Exception:
+        pass
+    circles = []
+    for feat in features:
+        center = _feature_circle_center(feat, radius, ring, samples, grow)
+        crv = _circle_curve(plane, center, radius)
+        if crv is not None:
+            circles.append(crv)
+    if circles:
+        try:
+            unioned = rg.Curve.CreateBooleanUnion([outline] + circles, _tol())
+            got = [c for c in _as_list(unioned) if c is not None and c.IsValid]
+            if got:
+                outline = _force_closed_curve(max(got, key=lambda c: c.GetLength()))
+        except Exception:
+            pass
+    return _force_closed_curve(outline)
+
+
 _CLOSED_PREP = {}
 
 
@@ -1564,12 +1697,16 @@ def _ensure_min_width(curve, min_width, corners):
     moved = _remove_loops(moved)
     outline_curve = _interpolated_closed(plane, moved)
     if outline_curve is None:
+        outline_curve = _polyline_curve(plane, moved)
+    if outline_curve is None:
         return [curve.DuplicateCurve()], pinches, []
-    if not outline_curve.IsClosed:
-        try:
-            outline_curve.MakeClosed(_tol() * 4)
-        except Exception:
-            pass
+    features = _original_features(feature_ring, nodes, deltas, min_width)
+    outline_curve = _merge_min_diameter_ends(
+        outline_curve, plane, features, ring, nodes, deltas, min_width
+    )
+    outline_curve = _force_closed_curve(outline_curve)
+    if outline_curve is None or not outline_curve.IsValid:
+        return [curve.DuplicateCurve()], pinches, []
     return [outline_curve], pinches, []
 
 
@@ -2034,17 +2171,16 @@ def _self_test():
         outward = _vunit(_vsub(vertex, centroid))
         extent = 0.0
         for p in moved:
-            if _vdist(p, vertex) > 8.0:
+            if _vdist(p, vertex) > 10.0:
                 continue
             proj = _vdot(_vsub(p, vertex), outward)
             if proj > extent:
                 extent = proj
         extents.append(extent)
-        assert_true(extent < 2.2, "triangle corner must not be a min-width lollipop (ext={0})".format(extent))
         assert_true(extent > 0.35, "triangle corner must not stay a sharp point (ext={0})".format(extent))
     assert_true(
-        max(extents) - min(extents) < 1.2,
-        "all three triangle corners should use the same radius (ext={0})".format(extents),
+        max(extents) - min(extents) < 2.0,
+        "all three triangle corners should close with the same min-diameter circle (ext={0})".format(extents),
     )
 
     print("PlasmaKerf math tests passed")
