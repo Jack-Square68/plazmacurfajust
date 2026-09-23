@@ -811,6 +811,39 @@ def _splice_chain(moved, chain):
     return _replace_span(moved, start, end, chain)
 
 
+def _splice_near_vertex(moved, vertex, chain, radius):
+    """Replace the offset loop around an original vertex when endpoint splice misses."""
+    n = len(moved)
+    if n < 4 or len(chain) < 2:
+        return moved
+    thresh = max(radius * 1.8, 1.0)
+    flags = [_vdist(p, vertex) < thresh for p in moved]
+    if not any(flags):
+        return moved
+    runs = _flag_runs(flags)
+    if not runs:
+        return moved
+
+    def run_len(se):
+        start, end = se
+        if start <= end:
+            return end - start + 1
+        return n - start + end + 1
+
+    start, end = max(runs, key=run_len)
+    if run_len((start, end)) < 1 or run_len((start, end)) > max(8, int(n * 0.35)):
+        return moved
+    return _replace_span(moved, start, end, chain)
+
+
+def _splice_feature(moved, chain, vertex, radius):
+    nxt = _splice_chain(moved, chain)
+    if nxt is not moved and len(nxt) >= 3:
+        return nxt
+    nxt = _splice_near_vertex(moved, vertex, chain, radius)
+    return nxt if len(nxt) >= 3 else moved
+
+
 def _pair_square_end(ring, ia, ib, min_width):
     """Two convex corners joined by a short edge → one blunt slot end."""
     n = len(ring)
@@ -878,9 +911,12 @@ def _original_features(feature_ring, samples, grow, min_width):
             continue
         if not _near_pinch(cluster["b"], samples, grow, min_width):
             continue
-        if _grow_near(cluster["b"], samples, grow) < 0.08:
-            continue
-        kind = "end" if cluster["turn"] > 1.85 else "fillet"
+        t1 = _vunit(_vsub(cluster["b"], cluster["a"]))
+        t2 = _vunit(_vsub(cluster["c"], cluster["b"]))
+        opposite = _vdot(t1, t2) < -0.90
+        # A 60° / concave-sided triangle corner is a fillet. Slot ends only
+        # when the two walls run back on themselves (hairpin).
+        kind = "end" if opposite and cluster["turn"] > 2.4 else "fillet"
         features.append({
             "kind": kind,
             "center": cluster["b"],
@@ -901,18 +937,24 @@ def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, 
     radius = min_width * 0.5
     features = _original_features(feature_ring, samples, grow, min_width)
     for feat in features:
+        vertex = feat.get("b") or feat.get("center")
         if feat["kind"] == "end":
             chain = _end_cap_chain(feat["center"], feat["p0"], feat["p1"], radius, interior_ring)
+            splice_r = radius
         else:
             grow1 = max(_grow_near(feat["a"], samples, grow), _grow_near(feat["b"], samples, grow))
             grow2 = max(_grow_near(feat["b"], samples, grow), _grow_near(feat["c"], samples, grow))
-            chain = _fillet_grown_corner(
-                feat["a"], feat["b"], feat["c"], grow1, grow2, radius, interior_ring
-            )
+            join_r = max(grow1, grow2)
+            if join_r < 0.08:
+                continue
+            # Classic offset join: one circular arc of the wall grow, not a
+            # min-width/2 lollipop and not a leftover sharp point.
+            chain = _vertex_round_join(feat["a"], feat["b"], feat["c"], join_r, interior_ring)
+            splice_r = join_r
         if len(chain) < 2:
             continue
-        nxt = _splice_chain(moved, chain)
-        if len(nxt) >= 3:
+        nxt = _splice_feature(moved, chain, vertex, splice_r)
+        if nxt is not moved and len(nxt) >= 3:
             moved = nxt
             protected.extend(chain)
     cleaned = _clean_ring(moved, 0.02) if len(moved) >= 3 else moved
@@ -973,8 +1015,10 @@ def _round_short_ends(points, ring, min_width, protected=None):
             i += 2
             continue
 
-        # Hairpin / leftover offset loop: walk back until the walls are min-width apart.
-        if abs(tb) > 1.75:
+        # Hairpin / leftover offset loop: only when the walls are opposite.
+        # A 60° triangle corner turns ~120° and must stay a simple fillet.
+        wall_dot = _vdot(_vunit(_vsub(b, a)), _vunit(_vsub(c, b)))
+        if abs(tb) > 2.4 and wall_dot < -0.90:
             cap = None
             for dist in (radius * 0.75, radius, radius * 1.2, radius * 1.5):
                 p0, i0 = _walk_along(points, i, -1, dist)
@@ -1514,7 +1558,7 @@ def _ensure_min_width(curve, min_width, corners):
     moved = _remove_loops(_clean_ring(moved, 0.02))
     feature_ring = corners_xy if len(corners_xy) >= 3 else ring
     moved, protected = _apply_original_features(
-        moved, feature_ring, ring, samples, raw, min_width
+        moved, feature_ring, ring, nodes, deltas, min_width
     )
     moved = _round_short_ends(moved, ring, min_width, protected)
     moved = _remove_loops(moved)
@@ -1954,7 +1998,7 @@ def _self_test():
         (37.0, 3.0), (0.0, 3.0),
     ]
     moved, pinches = ensure_min_width_ring(elbow, 6.0)
-    corner = [p for p in moved if p[0] > 38.0 and p[1] < 1.55]
+    corner = [p for p in moved if p[0] >= 40.0 and p[1] <= 0.0]
     signs = []
     for i in range(1, len(corner) - 1):
         turn = _turn_at(corner[i - 1], corner[i], corner[i + 1])
@@ -1967,6 +2011,41 @@ def _self_test():
     assert_true(pinches > 0, "elbow corner check should still pinch")
     assert_true(len(corner) >= 4, "elbow corner should keep a sampled radius")
     assert_true(flips == 0, "elbow corner should be one radius, not an S-wave (flips={0})".format(flips))
+
+    # Concave-sided triangle: three sharp corners must get the same simple
+    # offset join, not a split lollipop on some tips and a point on others.
+    centroid = (40.0, 70.0 / 3.0)
+    bowed = []
+    for a, b in [((0.0, 0.0), (80.0, 0.0)), ((80.0, 0.0), (40.0, 70.0)), ((40.0, 70.0), (0.0, 0.0))]:
+        mid = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+        inward = _vunit(_vsub(centroid, mid))
+        ctrl = _vadd(mid, _vmul(inward, 8.0))
+        for k in range(24):
+            t = k / 24.0
+            bowed.append((
+                (1.0 - t) * (1.0 - t) * a[0] + 2.0 * (1.0 - t) * t * ctrl[0] + t * t * b[0],
+                (1.0 - t) * (1.0 - t) * a[1] + 2.0 * (1.0 - t) * t * ctrl[1] + t * t * b[1],
+            ))
+    moved, pinches = ensure_min_width_ring(bowed, 6.0)
+    assert_true(pinches > 0, "bowed triangle should pinch at the corners")
+    assert_true(not _polyline_self_intersects(moved), "triangle corners must not split")
+    extents = []
+    for vertex in ((0.0, 0.0), (80.0, 0.0), (40.0, 70.0)):
+        outward = _vunit(_vsub(vertex, centroid))
+        extent = 0.0
+        for p in moved:
+            if _vdist(p, vertex) > 8.0:
+                continue
+            proj = _vdot(_vsub(p, vertex), outward)
+            if proj > extent:
+                extent = proj
+        extents.append(extent)
+        assert_true(extent < 2.2, "triangle corner must not be a min-width lollipop (ext={0})".format(extent))
+        assert_true(extent > 0.35, "triangle corner must not stay a sharp point (ext={0})".format(extent))
+    assert_true(
+        max(extents) - min(extents) < 1.2,
+        "all three triangle corners should use the same radius (ext={0})".format(extents),
+    )
 
     print("PlasmaKerf math tests passed")
 
