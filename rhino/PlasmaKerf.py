@@ -8,8 +8,9 @@ torch centerline. Enter bakes the result onto layers.
 Rhino 7 / 8
 -----------
 Closed openings are sampled once to a polyline (capped) for width only.
-The baked outline is one closed periodic cubic through the offset walls —
-a few-node fair NURBS, never a 1200-point interpolant or grafted tip caps.
+The baked outline keeps the original few-CV NURBS when it can (CVs slide
+outward). Otherwise it is one closed periodic cubic B-spline through the
+offset walls — never CreateInterpolatedCurve, which looped and spiked.
 Slot ends get a MinWidth/2 semicircle around the original tip. Pointed
 corners of a wide opening stay as drawn. Rhino is not asked to CurveCurve
 / GetLength / Contains on every sample, so a koru no longer locks the UI.
@@ -2488,32 +2489,18 @@ def _nurbs_from_xy_controls(plane, cvs, degree=5):
 
 
 def _nurbs_periodic_from_ring(plane, ring, n_ctrl):
-    """Few-node periodic cubic of a fair ring — never a 1200-point interpolant."""
+    """Few-node periodic cubic B-spline of a fair ring.
+
+    Never CreateInterpolatedCurve: a chord interpolant through a handful of
+    tip samples overshoots into loops, spikes, and an open curve that
+    `_force_closed_curve` then stitches with a straight line.
+    """
     if plane is None or len(ring) < 6:
         return None
     ctrl = _arc_length_resample(ring, max(6, int(n_ctrl)), True)
     if len(ctrl) < 6:
         return None
     pts = [_from_xy(plane, p) for p in ctrl]
-    styles = []
-    try:
-        styles.append(rg.CurveKnotStyle.ChordPeriodic)
-    except Exception:
-        pass
-    try:
-        styles.append(rg.CurveKnotStyle.Chord)
-    except Exception:
-        pass
-    for style in styles:
-        try:
-            crv = rg.Curve.CreateInterpolatedCurve(pts, 3, style)
-        except Exception:
-            crv = None
-        if crv is None or not getattr(crv, "IsValid", False):
-            continue
-        crv = _force_closed_curve(crv)
-        if crv is not None and crv.IsValid and not _curve_self_intersects(crv):
-            return crv
     try:
         crv = rg.NurbsCurve.Create(True, 3, pts)
     except Exception:
@@ -2524,6 +2511,20 @@ def _nurbs_periodic_from_ring(plane, ring, n_ctrl):
     if crv is None or not crv.IsValid or _curve_self_intersects(crv):
         return None
     return crv
+
+
+def _nurbs_usable(curve):
+    """Closed, valid, and not self-crossing — reject interpolant wreckage."""
+    if curve is None or not getattr(curve, "IsValid", False):
+        return False
+    curve = _force_closed_curve(curve)
+    if curve is None or not getattr(curve, "IsValid", False):
+        return False
+    if not getattr(curve, "IsClosed", False):
+        return False
+    if _curve_self_intersects(curve):
+        return False
+    return True
 
 
 def _fair_blend_between(a, b, radius, plane, ring):
@@ -2974,28 +2975,37 @@ def _ensure_min_width(curve, min_width, corners):
     has_end = any(f.get("kind") == "end" for f in features)
 
     outline = None
-    # Keep the artist's few CVs when there is no sharp tip to rebuild.
     try:
         orig_nurbs = curve.ToNurbsCurve()
         orig_cvs = orig_nurbs.Points.Count if orig_nurbs is not None else 0
     except Exception:
         orig_cvs = 0
-    if not tips and orig_cvs and orig_cvs <= 48 and not _mostly_thin(raw):
+
+    # Keep the artist's few CVs whenever we can. Rebuilding that NURBS as an
+    # interpolant is what produced the loop / spike / open vertical in Rhino.
+    if orig_cvs and orig_cvs <= 64:
         moved = _move_nurbs_cvs(curve, plane, samples, deltas, ring)
-        if moved is not None:
+        if _nurbs_usable(moved):
             if has_end:
                 capped = _nurbs_same_tip_caps(moved, 0.0, radius, plane, ring, features)
-                outline = capped if capped is not None else moved
+                outline = capped if _nurbs_usable(capped) else moved
             else:
                 outline = moved
+
+    if outline is None and (_mostly_thin(raw) or _grow_is_uniform(raw)):
+        grown = _grow_opening(curve, _median_positive(raw), "Round")
+        if _nurbs_usable(grown):
+            outline = grown
 
     if outline is None:
         moved_ring, _ = _apply_min_width(ring, samples, spacing, min_width)
         n_ctrl = _fair_ctrl_count(len(tips) if tips else 3)
         outline = _nurbs_periodic_from_ring(plane, moved_ring, n_ctrl)
+        if not _nurbs_usable(outline):
+            outline = None
 
     if outline is None or not getattr(outline, "IsValid", False):
-        # Last resort: keep the original NURBS. Never emit a dense interpolant.
+        # Last resort: keep the original NURBS. Never emit an interpolant.
         return [curve.DuplicateCurve()], pinches, []
     outline = _force_closed_curve(outline)
     if outline is None or not outline.IsValid:
@@ -3517,6 +3527,17 @@ def _self_test():
     assert_true(
         best_run < 8,
         "triangle tips must not be grafted min-width circles (circle-run={0})".format(best_run),
+    )
+    # Rhino must bake a B-spline through these CVs, not an interpolant.
+    # Interpolating a handful of tip samples is what looped and spiked.
+    bake_cvs = _arc_length_resample(moved, 24, True)
+    baked = _sample_periodic_bspline(bake_cvs, 0.35)
+    assert_true(len(baked) >= 12, "periodic B-spline bake should stay a curve")
+    assert_true(not _polyline_self_intersects(baked), "B-spline bake must not loop")
+    assert_true(
+        min(p[0] for p in baked) > min(p[0] for p in moved) - 4.0
+        and max(p[0] for p in baked) < max(p[0] for p in moved) + 4.0,
+        "B-spline bake must not spike past the fair outline",
     )
 
     # Same G2 fair blend on every tip — tangent to both walls, curvature eases in.
