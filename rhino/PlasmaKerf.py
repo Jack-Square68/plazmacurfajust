@@ -10,9 +10,11 @@ Rhino 7 / 8
 Closed openings are sampled once to a polyline (capped) for width. Each node
 on the original curve then moves out along its normal by a scaled amount:
 full grow at the pinch, fading with distance along the curve so the offset
-stays one smooth parallel. Pointed corners of a wide opening stay as drawn.
-Rhino is not asked to CurveCurve / GetLength / Contains on every sample, so
-a koru no longer locks the UI.
+stays one smooth parallel. Sharp corners in a pinch get a simple radius of
+MinWidth/2 on the original vertex (no S-wave). Square / pointed ends get one
+semicircle of MinWidth/2 around the original tip. Pointed corners of a wide
+opening stay as drawn. Rhino is not asked to CurveCurve / GetLength /
+Contains on every sample, so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -584,7 +586,350 @@ def _semicircle_cap(p0, p1, radius, ring):
     return [p0] + _arc_points(mid, p0, p1, radius, ring) + [p1]
 
 
-def _round_short_ends(points, ring, min_width):
+def _ring_path_len(ring, start, end):
+    n = len(ring)
+    if n == 0 or start == end:
+        return 0.0
+    total = 0.0
+    i = start
+    for _ in range(n):
+        nxt = (i + 1) % n
+        total += _vdist(ring[i], ring[nxt])
+        if nxt == end:
+            return total
+        i = nxt
+    return total
+
+
+def _grow_near(point, samples, grow):
+    if not samples or not grow:
+        return 0.0
+    best = 0
+    best_d = 1e300
+    for i, sample in enumerate(samples):
+        d = _vdist(point, sample["point"])
+        if d < best_d:
+            best_d = d
+            best = i
+    return grow[best] if best < len(grow) else 0.0
+
+
+def _near_pinch(point, samples, grow, min_width):
+    if not samples or not grow:
+        return False
+    thresh = max(min_width * 1.8, 6.0)
+    for i, sample in enumerate(samples):
+        if i < len(grow) and grow[i] > 0.04 and _vdist(point, sample["point"]) < thresh:
+            return True
+    return False
+
+
+def _cluster_original_turns(ring, min_width):
+    """Group nearby same-sign turns so a tessellated CAD corner is one feature."""
+    n = len(ring)
+    if n < 3:
+        return []
+    turns = [_turn_at(ring[(i - 1 + n) % n], ring[i], ring[(i + 1) % n]) for i in range(n)]
+    window = max(min_width * 0.45, 1.2)
+    clusters = []
+    used = [False] * n
+    for i in range(n):
+        if used[i] or abs(turns[i]) < 0.12:
+            continue
+        sign = 1.0 if turns[i] > 0.0 else -1.0
+        acc = turns[i]
+        idxs = [i]
+        used[i] = True
+        j = i
+        dist = 0.0
+        while True:
+            nxt = (j + 1) % n
+            if used[nxt]:
+                break
+            seg = _vdist(ring[j], ring[nxt])
+            if dist + seg > window:
+                break
+            if turns[nxt] * sign < -0.08:
+                break
+            if abs(turns[nxt]) >= 0.08:
+                acc += turns[nxt]
+                idxs.append(nxt)
+                used[nxt] = True
+            elif dist > 0.25:
+                break
+            dist += seg
+            j = nxt
+        if abs(acc) < 0.35:
+            for k in idxs:
+                used[k] = False
+            continue
+        apex = max(idxs, key=lambda k: abs(turns[k]))
+        clusters.append({
+            "idxs": idxs,
+            "apex": apex,
+            "turn": acc,
+            "a": ring[(idxs[0] - 1 + n) % n],
+            "b": ring[apex],
+            "c": ring[(idxs[-1] + 1) % n],
+        })
+    return clusters
+
+
+def _line_intersect_unbounded(a, b, c, d):
+    ab = _vsub(b, a)
+    cd = _vsub(d, c)
+    den = _vcross(ab, cd)
+    if abs(den) < 1e-12:
+        return None
+    ac = _vsub(c, a)
+    t = _vcross(ac, cd) / den
+    return (a[0] + ab[0] * t, a[1] + ab[1] * t)
+
+
+def _wall_outward(a, b, ring):
+    tangent = _vunit(_vsub(b, a))
+    inward = _vleft(tangent)
+    mid = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+    probe = _vadd(mid, _vmul(inward, 0.35))
+    if not _point_in_ring(probe, ring):
+        inward = _vmul(inward, -1.0)
+    return _vmul(inward, -1.0)
+
+
+def _vertex_round_join(a, b, c, radius, ring):
+    """One circular join of `radius` around original vertex b — not an S-wave."""
+    if radius < 0.04:
+        return [b]
+    out1 = _wall_outward(a, b, ring)
+    out2 = _wall_outward(b, c, ring)
+    p0 = _vadd(b, _vmul(out1, radius))
+    p1 = _vadd(b, _vmul(out2, radius))
+    if _vdist(p0, p1) < 0.04:
+        return [p0]
+    return [p0] + _arc_points(b, p0, p1, radius, ring) + [p1]
+
+
+def _fillet_grown_corner(a, b, c, grow1, grow2, radius, ring):
+    """Simple half-min-width radius on the two grown walls at original corner b."""
+    if radius < 0.04:
+        return [b]
+    out1 = _wall_outward(a, b, ring)
+    out2 = _wall_outward(b, c, ring)
+    g1a = _vadd(a, _vmul(out1, grow1))
+    g1b = _vadd(b, _vmul(out1, grow1))
+    g2b = _vadd(b, _vmul(out2, grow2))
+    g2c = _vadd(c, _vmul(out2, grow2))
+    corner = _line_intersect_unbounded(g1a, g1b, g2b, g2c)
+    if corner is None:
+        return _vertex_round_join(a, b, c, radius, ring)
+    t1 = _vunit(_vsub(corner, g1a))
+    if t1[0] == 0.0 and t1[1] == 0.0:
+        t1 = _vunit(_vsub(g1b, g1a))
+    t2 = _vunit(_vsub(g2c, corner))
+    if t2[0] == 0.0 and t2[1] == 0.0:
+        t2 = _vunit(_vsub(g2c, g2b))
+    if (t1[0] == 0.0 and t1[1] == 0.0) or (t2[0] == 0.0 and t2[1] == 0.0):
+        return _vertex_round_join(a, b, c, radius, ring)
+    turn = math.atan2(_vcross(t1, t2), _vdot(t1, t2))
+    if abs(turn) < 0.12:
+        return [corner]
+    tan_h = math.tan(abs(turn) * 0.5)
+    if tan_h < 1e-8:
+        return [corner]
+    trim = radius * tan_h
+    d1 = _vdist(g1a, corner)
+    d2 = _vdist(corner, g2c)
+    if trim > d1 * 0.98:
+        trim = d1 * 0.98
+    if trim > d2 * 0.98:
+        trim = d2 * 0.98
+    if trim < 0.04:
+        return [corner]
+    r_used = trim / tan_h
+    p0 = (corner[0] - t1[0] * trim, corner[1] - t1[1] * trim)
+    p1 = (corner[0] + t2[0] * trim, corner[1] + t2[1] * trim)
+    left = (-t1[1], t1[0])
+    inward = left if turn > 0.0 else (-left[0], -left[1])
+    center = (p0[0] + inward[0] * r_used, p0[1] + inward[1] * r_used)
+    return [p0] + _arc_points(center, p0, p1, r_used, ring) + [p1]
+
+
+def _end_cap_chain(center, p0, p1, radius, ring):
+    """Semicircle of `radius` around the original square / pointed end."""
+    chord = _vunit(_vsub(p1, p0))
+    if chord[0] == 0.0 and chord[1] == 0.0:
+        return [center]
+    a = _vadd(center, _vmul(chord, -radius))
+    b = _vadd(center, _vmul(chord, radius))
+    return _semicircle_cap(a, b, radius, ring)
+
+
+def _nearest_index(points, target):
+    best_i = 0
+    best = 1e300
+    for i, p in enumerate(points):
+        d = _vdist(p, target)
+        if d < best:
+            best = d
+            best_i = i
+    return best_i, best
+
+
+def _replace_span(moved, start, end, chain):
+    n = len(moved)
+    if n < 3 or start == end:
+        return moved
+    before = moved[(start - 1 + n) % n]
+    after = moved[(end + 1) % n]
+    d_fwd = _vdist(before, chain[0]) + _vdist(chain[-1], after)
+    d_rev = _vdist(before, chain[-1]) + _vdist(chain[0], after)
+    if d_rev < d_fwd:
+        chain = list(reversed(chain))
+    if start <= end:
+        return moved[:start] + chain + moved[end + 1:]
+    return chain + moved[end + 1:start]
+
+
+def _splice_chain(moved, chain):
+    """Replace the short span between the chain's landing points with the chain."""
+    if len(moved) < 4 or len(chain) < 2:
+        return moved
+    i0, d0 = _nearest_index(moved, chain[0])
+    i1, d1 = _nearest_index(moved, chain[-1])
+    if i0 == i1:
+        return moved
+    n = len(moved)
+    span_fwd = (i1 - i0) % n
+    span_rev = (i0 - i1) % n
+    if span_fwd <= span_rev:
+        start, end, span = i0, i1, span_fwd
+    else:
+        start, end, span = i1, i0, span_rev
+        chain = list(reversed(chain))
+    if span < 1 or span > max(6, int(n * 0.35)):
+        return moved
+    return _replace_span(moved, start, end, chain)
+
+
+def _pair_square_end(ring, ia, ib, min_width):
+    """Two convex corners joined by a short edge → one blunt slot end."""
+    n = len(ring)
+    fwd = _ring_path_len(ring, ia, ib)
+    rev = _ring_path_len(ring, ib, ia)
+    if fwd <= rev:
+        start, end, span = ia, ib, fwd
+    else:
+        start, end, span = ib, ia, rev
+    if not (min_width * 0.12 < span < min_width * 1.65):
+        return None
+    prev_s = ring[(start - 1 + n) % n]
+    next_e = ring[(end + 1) % n]
+    if _vdist(prev_s, ring[start]) < span * 0.9:
+        return None
+    if _vdist(ring[end], next_e) < span * 0.9:
+        return None
+    in_dir = _vunit(_vsub(ring[start], prev_s))
+    out_dir = _vunit(_vsub(next_e, ring[end]))
+    if _vdot(in_dir, out_dir) > -0.28:
+        return None
+    center = (
+        (ring[start][0] + ring[end][0]) * 0.5,
+        (ring[start][1] + ring[end][1]) * 0.5,
+    )
+    return {
+        "kind": "end",
+        "center": center,
+        "p0": ring[start],
+        "p1": ring[end],
+    }
+
+
+def _original_features(feature_ring, samples, grow, min_width):
+    """Sharp original corners / square ends that sit in a pinch."""
+    clusters = _cluster_original_turns(feature_ring, min_width)
+    if not clusters:
+        return []
+    used = [False] * len(clusters)
+    features = []
+    for a in range(len(clusters)):
+        if used[a] or clusters[a]["turn"] <= 0.35:
+            continue
+        for b in range(a + 1, len(clusters)):
+            if used[b] or clusters[b]["turn"] <= 0.35:
+                continue
+            paired = _pair_square_end(
+                feature_ring,
+                clusters[a]["apex"],
+                clusters[b]["apex"],
+                min_width,
+            )
+            if paired is None:
+                continue
+            if not _near_pinch(paired["center"], samples, grow, min_width):
+                continue
+            features.append(paired)
+            used[a] = True
+            used[b] = True
+            break
+    for i, cluster in enumerate(clusters):
+        if used[i]:
+            continue
+        if cluster["turn"] <= 0.35:
+            continue
+        if not _near_pinch(cluster["b"], samples, grow, min_width):
+            continue
+        if _grow_near(cluster["b"], samples, grow) < 0.08:
+            continue
+        kind = "end" if cluster["turn"] > 1.85 else "fillet"
+        features.append({
+            "kind": kind,
+            "center": cluster["b"],
+            "p0": cluster["a"],
+            "p1": cluster["c"],
+            "a": cluster["a"],
+            "b": cluster["b"],
+            "c": cluster["c"],
+        })
+    return features
+
+
+def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, min_width):
+    """Splices half-min-width radii / end caps from the original CAD corners."""
+    protected = []
+    if len(moved) < 4 or min_width <= 0:
+        return moved, protected
+    radius = min_width * 0.5
+    features = _original_features(feature_ring, samples, grow, min_width)
+    for feat in features:
+        if feat["kind"] == "end":
+            chain = _end_cap_chain(feat["center"], feat["p0"], feat["p1"], radius, interior_ring)
+        else:
+            grow1 = max(_grow_near(feat["a"], samples, grow), _grow_near(feat["b"], samples, grow))
+            grow2 = max(_grow_near(feat["b"], samples, grow), _grow_near(feat["c"], samples, grow))
+            chain = _fillet_grown_corner(
+                feat["a"], feat["b"], feat["c"], grow1, grow2, radius, interior_ring
+            )
+        if len(chain) < 2:
+            continue
+        nxt = _splice_chain(moved, chain)
+        if len(nxt) >= 3:
+            moved = nxt
+            protected.extend(chain)
+    cleaned = _clean_ring(moved, 0.02) if len(moved) >= 3 else moved
+    return cleaned, protected
+
+
+def _near_protected(point, protected, radius):
+    if not protected:
+        return False
+    thresh = radius * 1.2
+    for q in protected:
+        if _vdist(point, q) < thresh:
+            return True
+    return False
+
+
+def _round_short_ends(points, ring, min_width, protected=None):
     """Cap slot / taper ends with a semicircle of radius min_width/2."""
     n = len(points)
     if n < 8 or min_width <= 0:
@@ -594,7 +939,10 @@ def _round_short_ends(points, ring, min_width):
     out = []
     i = 0
     while i < n:
-        if used[i]:
+        if used[i] or _near_protected(points[i], protected, radius):
+            if not used[i]:
+                out.append(points[i])
+                used[i] = True
             i += 1
             continue
         a = points[(i - 1 + n) % n]
@@ -770,18 +1118,11 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
         return (ring, 0)
     moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
     cleaned = _remove_loops(_clean_ring(moved, 0.02))
-    n = len(cleaned)
-    if n >= 3:
-        radii = []
-        for i in range(n):
-            # Match each corner to nearby sample delta; never use a fat vertex-centered cap.
-            nearest = min(
-                range(len(samples)),
-                key=lambda k: _vdist(cleaned[i], samples[k]["point"]),
-            )
-            radii.append(max(deltas[nearest], 0.0))
-        cleaned = _fillet_offset_ring(cleaned, radii, ring)
-        cleaned = _round_short_ends(cleaned, ring, min_width)
+    if len(cleaned) >= 3:
+        cleaned, protected = _apply_original_features(
+            cleaned, ring, ring, samples, deltas, min_width
+        )
+        cleaned = _round_short_ends(cleaned, ring, min_width, protected)
         cleaned = _remove_loops(cleaned)
     return (cleaned if len(cleaned) >= 3 else ring, pinches)
 
@@ -1003,6 +1344,46 @@ def _curve_ring_xy(curve, plane, count):
     return _ensure_ccw(_clean_ring(pts, max(_tol(), 0.02)))
 
 
+def _curve_corners_xy(curve, plane):
+    """Original polyline vertices / C1 kinks — the CAD corners to fillet or cap."""
+    pts = []
+    try:
+        ok, pline = curve.TryGetPolyline()
+        if ok and pline is not None:
+            count = pline.Count
+            for i in range(count):
+                pts.append(_to_xy(plane, pline[i]))
+            if len(pts) > 2 and _vdist(pts[0], pts[-1]) <= max(_tol(), 0.02):
+                pts.pop()
+            if len(pts) >= 3:
+                return _ensure_ccw(_clean_ring(pts, max(_tol(), 0.02)))
+    except Exception:
+        pts = []
+    try:
+        domain = curve.Domain
+        t = domain.Min
+        pts = [_to_xy(plane, curve.PointAt(t))]
+        while True:
+            got = curve.GetNextDiscontinuity(rg.Continuity.C1_locus, t, domain.Max)
+            if isinstance(got, tuple):
+                ok, t = got[0], got[1]
+            else:
+                ok = bool(got)
+                if not ok:
+                    break
+                t = got
+            if not ok:
+                break
+            pts.append(_to_xy(plane, curve.PointAt(t)))
+        if curve.IsClosed and len(pts) > 1 and _vdist(pts[0], pts[-1]) <= max(_tol(), 0.02):
+            pts.pop()
+        if len(pts) >= 3:
+            return _ensure_ccw(_clean_ring(pts, max(_tol(), 0.02)))
+    except Exception:
+        pass
+    return []
+
+
 def _polyline_curve(plane, ring):
     if len(ring) < 2:
         return None
@@ -1117,9 +1498,10 @@ def _ensure_min_width(curve, min_width, corners):
         spacing = length / float(max(len(samples), 1))
         node_count = min(1200, max(240, int(math.ceil(length / 0.3))))
         nodes = _samples_from_curve(curve, plane, ring, node_count)
-        prep = (plane, ring, samples, spacing, nodes)
+        corners_xy = _curve_corners_xy(curve, plane)
+        prep = (plane, ring, samples, spacing, nodes, corners_xy)
         _CLOSED_PREP[key] = prep
-    plane, ring, samples, spacing, nodes = prep
+    plane, ring, samples, spacing, nodes, corners_xy = prep
     _assign_widths(samples, ring, min_width)
     raw = _raw_deltas(samples, min_width)
     if not any(d > 1e-4 for d in raw):
@@ -1130,7 +1512,11 @@ def _ensure_min_width(curve, min_width, corners):
         return [curve.DuplicateCurve()], 0, []
     moved = [_offset_point(nodes[i], deltas[i], ring) for i in range(len(nodes))]
     moved = _remove_loops(_clean_ring(moved, 0.02))
-    moved = _round_short_ends(moved, ring, min_width)
+    feature_ring = corners_xy if len(corners_xy) >= 3 else ring
+    moved, protected = _apply_original_features(
+        moved, feature_ring, ring, samples, raw, min_width
+    )
+    moved = _round_short_ends(moved, ring, min_width, protected)
     moved = _remove_loops(moved)
     outline_curve = _interpolated_closed(plane, moved)
     if outline_curve is None:
@@ -1543,6 +1929,44 @@ def _self_test():
     typical = steps[len(steps) // 2]
     assert_true(pinches > 0, "continuity slot should still pinch")
     assert_true(max(steps) < typical * 12 + 4.0, "outline must stay one curve, max step={0}".format(max(steps)))
+
+    # Square ends: one semicircle of r = min_width/2 around the original tip, no hook.
+    thin = [(0.0, 0.0), (80.0, 0.0), (80.0, 3.0), (0.0, 3.0)]
+    moved, pinches = ensure_min_width_ring(thin, 6.0)
+    right_cap = [p for p in moved if p[0] > 79.5]
+    left_cap = [p for p in moved if p[0] < 0.5]
+    assert_true(pinches > 0, "square-end slot should pinch")
+    assert_true(len(right_cap) >= 3, "right end should be a sampled cap")
+    assert_true(
+        all(_vdist(p, (80.0, 1.5)) < 3.45 for p in right_cap),
+        "right end must stay on a half-min-width semicircle, not a hook",
+    )
+    assert_true(
+        all(_vdist(p, (0.0, 1.5)) < 3.45 for p in left_cap),
+        "left end must stay on a half-min-width semicircle, not a hook",
+    )
+    assert_true(max(p[0] for p in moved) < 83.6, "right cap must not overshoot r=3")
+    assert_true(min(p[1] for p in right_cap) > -3.4, "right cap must not curl into a hook")
+
+    # Thin-slot outer corner: one circular radius, no S-wave inflection.
+    elbow = [
+        (0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (37.0, 40.0),
+        (37.0, 3.0), (0.0, 3.0),
+    ]
+    moved, pinches = ensure_min_width_ring(elbow, 6.0)
+    corner = [p for p in moved if p[0] > 38.0 and p[1] < 1.55]
+    signs = []
+    for i in range(1, len(corner) - 1):
+        turn = _turn_at(corner[i - 1], corner[i], corner[i + 1])
+        if abs(turn) > 0.03:
+            signs.append(1 if turn > 0.0 else -1)
+    flips = 0
+    for i in range(1, len(signs)):
+        if signs[i] != signs[i - 1]:
+            flips += 1
+    assert_true(pinches > 0, "elbow corner check should still pinch")
+    assert_true(len(corner) >= 4, "elbow corner should keep a sampled radius")
+    assert_true(flips == 0, "elbow corner should be one radius, not an S-wave (flips={0})".format(flips))
 
     print("PlasmaKerf math tests passed")
 
