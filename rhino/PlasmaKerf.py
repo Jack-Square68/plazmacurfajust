@@ -8,11 +8,12 @@ torch centerline. Enter bakes the result onto layers.
 Rhino 7 / 8
 -----------
 Closed openings are sampled once to a polyline (capped) for width. Already-wide
-walls keep the original NURBS. Only under-width pinches are offset along the
-original normals and joined back in. Pointed corners of a wide opening stay as
-drawn — they are not treated as thin slots. Sharp corners on a grown pinch get
-a simple wall-to-wall radius, not a bulge. Rhino is not asked to CurveCurve /
-GetLength / Contains on every sample, so a koru no longer locks the UI.
+walls stay on the original curve; only under-width pinches move out along the
+original normals. The result is one closed degree-3 NURBS — not separate
+trimmed pieces joined with kinks. Pointed corners of a wide opening stay as
+drawn. Sharp corners on a grown pinch get a simple wall-to-wall radius, not a
+bulge. Rhino is not asked to CurveCurve / GetLength / Contains on every sample,
+so a koru no longer locks the UI.
 
 Drag this file onto the Rhino window, or:
 
@@ -346,6 +347,62 @@ def _run_indices(start, end, n):
     if start <= end:
         return list(range(start, end + 1))
     return list(range(start, n)) + list(range(0, end + 1))
+
+
+def _ordered_runs(flags):
+    """All True/False runs in cyclic order, starting at a run boundary."""
+    n = len(flags)
+    if n == 0:
+        return []
+    start = 0
+    for i in range(n):
+        if flags[i] != flags[(i - 1 + n) % n]:
+            start = i
+            break
+    else:
+        return [(0, n - 1, flags[0])]
+    out = []
+    i = start
+    while True:
+        val = flags[i]
+        j = i
+        while True:
+            nxt = (j + 1) % n
+            if nxt == start or flags[nxt] != val:
+                out.append((i, j, val))
+                i = nxt
+                break
+            j = nxt
+        if i == start:
+            break
+    return out
+
+
+def _value_at_t(samples, values, t):
+    """Lerp a closed sample series at curve parameter t."""
+    n = len(samples)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return values[0]
+    ts = [s["t"] for s in samples]
+    if t <= ts[0] or t >= ts[-1]:
+        if abs(t - ts[0]) <= abs(t - ts[-1]):
+            return values[0]
+        return values[-1]
+    lo = 0
+    hi = n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if ts[mid] <= t:
+            lo = mid
+        else:
+            hi = mid
+    span = ts[hi] - ts[lo]
+    if span < 1e-12:
+        return values[lo]
+    u = (t - ts[lo]) / span
+    return values[lo] * (1.0 - u) + values[hi] * u
 
 
 def _suppress_short_runs(flags, min_len):
@@ -977,41 +1034,6 @@ def _interpolated_closed(plane, ring):
     return _polyline_curve(plane, ring)
 
 
-def _interpolated_open(plane, pts):
-    if not HAS_RHINO or len(pts) < 2:
-        return None
-    rh_pts = [_from_xy(plane, p) for p in pts]
-    if len(pts) == 2:
-        try:
-            return rg.LineCurve(rh_pts[0], rh_pts[1])
-        except Exception:
-            return None
-    try:
-        crv = rg.Curve.CreateInterpolatedCurve(rh_pts, 3)
-        if crv is not None and crv.IsValid and not _curve_self_intersects(crv):
-            return crv
-    except Exception:
-        pass
-    try:
-        return rg.PolylineCurve(rh_pts)
-    except Exception:
-        return None
-
-
-def _trim_span(curve, t0, t1):
-    try:
-        if abs(t1 - t0) < 1e-9:
-            return []
-        if t1 > t0:
-            return [c for c in _as_list(curve.Trim(t0, t1)) if c]
-        domain = curve.Domain
-        a = _as_list(curve.Trim(t0, domain.Max))
-        b = _as_list(curve.Trim(domain.Min, t1))
-        return [c for c in a + b if c]
-    except Exception:
-        return []
-
-
 def _shape_thin_run(pts, deltas, ring, min_width, closed):
     if len(pts) < 2:
         return pts
@@ -1029,64 +1051,29 @@ def _shape_thin_run(pts, deltas, ring, min_width, closed):
     return cleaned if len(cleaned) >= 2 else pts
 
 
-def _reconstruct_from_original(curve, plane, samples, deltas, ring, min_width):
-    """Keep the original NURBS on wide spans; interpolate only the pinches."""
-    n = len(samples)
-    if n < 4 or not HAS_RHINO:
-        return None
+def _offset_outline_points(dense, deltas, ring, min_width):
+    """One closed point list: original where wide, grown where thin."""
+    n = len(dense)
+    if n < 3:
+        return []
+    raw = [_offset_point(dense[i], deltas[i], ring) for i in range(n)]
     thin = [d > 0.08 for d in deltas]
-    if not any(thin):
-        return curve.DuplicateCurve()
     grown = list(thin)
     for i in range(n):
         if thin[i]:
             grown[(i - 1 + n) % n] = True
             grown[(i + 1) % n] = True
-    if all(grown):
-        return None
-    pieces = []
-    for start, end in _flag_runs(grown):
+    out = []
+    for start, end, is_thin in _ordered_runs(grown):
         idxs = _run_indices(start, end, n)
-        pts = [_offset_point(samples[i], deltas[i], ring) for i in idxs]
-        run_deltas = [deltas[i] for i in idxs]
-        shaped = _shape_thin_run(pts, run_deltas, ring, min_width, closed=False)
-        piece = _interpolated_open(plane, shaped)
-        if piece is None:
-            return None
-        pieces.append(piece)
-    wide = [not flag for flag in grown]
-    for start, end in _flag_runs(wide):
-        idxs = _run_indices(start, end, n)
-        if len(idxs) < 2:
-            continue
-        t0 = samples[idxs[0]]["t"]
-        t1 = samples[idxs[-1]]["t"]
-        trimmed = _trim_span(curve, t0, t1)
-        if not trimmed:
-            return None
-        pieces.extend(trimmed)
-    if not pieces:
-        return None
-    try:
-        joined = rg.Curve.JoinCurves(pieces, max(_tol() * 8, 0.15), False)
-        got = [c for c in _as_list(joined) if c]
-    except Exception:
-        got = []
-    if not got:
-        got = pieces
-    closed = [c for c in got if getattr(c, "IsClosed", False)]
-    if len(closed) == 1 and not _curve_self_intersects(closed[0]):
-        return closed[0]
-    if len(got) == 1:
-        crv = got[0]
-        if not crv.IsClosed:
-            try:
-                crv.MakeClosed(_tol() * 8)
-            except Exception:
-                pass
-        if crv.IsValid and crv.IsClosed and not _curve_self_intersects(crv):
-            return crv
-    return None
+        if is_thin:
+            sub = [raw[i] for i in idxs]
+            sub_d = [deltas[i] for i in idxs]
+            out.extend(_shape_thin_run(sub, sub_d, ring, min_width, False))
+        else:
+            for i in idxs:
+                out.append(raw[i])
+    return _remove_loops(_clean_ring(out, 0.02))
 
 
 _CLOSED_PREP = {}
@@ -1112,27 +1099,26 @@ def _ensure_min_width(curve, min_width, corners):
         count = min(MAX_SAMPLES, max(48, int(math.ceil(length / 0.35))))
         ring = _curve_ring_xy(curve, plane, count)
         ring = _cap_ring(_ensure_ccw(_clean_ring(ring, max(_tol(), 0.02))), MAX_SAMPLES)
-        out_count = min(320, max(96, int(math.ceil(length / 1.0))))
-        samples = _samples_from_curve(curve, plane, ring, out_count)
+        width_count = min(320, max(96, int(math.ceil(length / 1.0))))
+        samples = _samples_from_curve(curve, plane, ring, width_count)
         spacing = length / float(max(len(samples), 1))
-        prep = (plane, ring, samples, spacing)
+        dense_count = min(1400, max(200, int(math.ceil(length / 0.28))))
+        dense = _samples_from_curve(curve, plane, ring, dense_count)
+        prep = (plane, ring, samples, spacing, dense)
         _CLOSED_PREP[key] = prep
-    plane, ring, samples, spacing = prep
+    plane, ring, samples, spacing, dense = prep
     _assign_widths(samples, ring, min_width)
     deltas, pinches = _compute_deltas(samples, spacing, min_width)
     if pinches == 0:
         return [curve.DuplicateCurve()], 0, []
-    thin_count = sum(1 for d in deltas if d > 0.08)
-    outline_curve = None
-    if thin_count < int(0.8 * len(deltas)):
-        outline_curve = _reconstruct_from_original(
-            curve, plane, samples, deltas, ring, min_width
-        )
-    if outline_curve is None:
-        moved, pinches = _apply_min_width(ring, samples, spacing, min_width, round_corners=False)
-        if pinches == 0:
-            return [curve.DuplicateCurve()], 0, []
-        outline_curve = _interpolated_closed(plane, moved)
+    dense_deltas = [_value_at_t(samples, deltas, s["t"]) for s in dense]
+    for i in range(len(dense_deltas)):
+        if dense_deltas[i] <= 0.08:
+            dense_deltas[i] = 0.0
+    moved = _offset_outline_points(dense, dense_deltas, ring, min_width)
+    if len(moved) < 4:
+        return [curve.DuplicateCurve()], pinches, []
+    outline_curve = _interpolated_closed(plane, moved)
     if outline_curve is None:
         return [curve.DuplicateCurve()], pinches, []
     if not outline_curve.IsClosed:
@@ -1523,6 +1509,15 @@ def _self_test():
     neck_h = (max(p[1] for p in neck) - min(p[1] for p in neck)) if neck else 0.0
     assert_true(pinches > 0, "hourglass neck should be under min width")
     assert_true(neck_h > 5.2, "hourglass neck should grow toward 6 mm, got {0}".format(neck_h))
+
+    # One closed ring: no seam gap between a grown pinch and a wide wall.
+    thin = [(0.0, 0.0), (80.0, 0.0), (80.0, 3.0), (0.0, 3.0)]
+    moved, pinches = ensure_min_width_ring(thin, 6.0)
+    steps = [_vdist(moved[i], moved[(i + 1) % len(moved)]) for i in range(len(moved))]
+    steps.sort()
+    typical = steps[len(steps) // 2]
+    assert_true(pinches > 0, "continuity slot should still pinch")
+    assert_true(max(steps) < typical * 12 + 4.0, "outline must stay one curve, max step={0}".format(max(steps)))
 
     print("PlasmaKerf math tests passed")
 
