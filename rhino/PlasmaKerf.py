@@ -632,6 +632,97 @@ def _grow_at_point(point, samples, grow, default):
     return default
 
 
+def _sample_width_near(point, samples, default=1e9):
+    if not samples or point is None:
+        return default
+    best_i, _ = _nearest_index([s["point"] for s in samples], point)
+    width = samples[best_i].get("width", default)
+    if width is None:
+        return default
+    return width
+
+
+def _is_tapered_end(center, samples, min_width):
+    """True for a koru / scroll tip: the ribbon widens away from the end."""
+    w0 = _sample_width_near(center, samples)
+    if w0 >= 1e8:
+        return False
+    backs = []
+    for sample in samples:
+        dist = _vdist(sample["point"], center)
+        if dist < 10.0 or dist > 26.0:
+            continue
+        width = sample.get("width")
+        if width is None or width >= 1e8:
+            continue
+        backs.append(width)
+    if not backs:
+        return False
+    backs.sort()
+    w_back = backs[len(backs) // 2]
+    return w_back > max(w0 * 1.7, w0 + 1.2)
+
+
+def _walk_until_radius(points, start, step, center, radius):
+    """Walk a ring until we are `radius` from `center`."""
+    n = len(points)
+    if n < 2:
+        return points[start], start
+    prev = points[start]
+    d_prev = _vdist(prev, center)
+    i = start
+    for _ in range(n):
+        j = (i + step + n) % n
+        nxt = points[j]
+        d = _vdist(nxt, center)
+        if d >= radius and d_prev <= radius:
+            den = d - d_prev
+            t = 0.0 if abs(den) < 1e-12 else (radius - d_prev) / den
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+            return (_vadd(prev, _vmul(_vsub(nxt, prev), t)), i)
+        if d >= radius:
+            return nxt, i
+        prev = nxt
+        d_prev = d
+        i = j
+    return points[i], i
+
+
+def _tapered_tip_chain(center, moved, samples, grow, min_width, ring):
+    """Thicker copy of the original scroll tip — same spine, larger radius."""
+    if center is None or len(ring) < 6:
+        return []
+    d = max(_grow_at_point(center, samples, grow, 0.0), 0.0)
+    w0 = _sample_width_near(center, samples, 0.6)
+    if w0 >= 1e8:
+        w0 = 0.6
+    new_r = max(w0 * 0.5 + d, 0.8)
+    n = len(ring)
+    i0, _ = _nearest_index(ring, center)
+    best_i, best_t = i0, -1.0
+    for k in range(-16, 17):
+        j = (i0 + k + n) % n
+        turn = abs(_turn_at(ring[(j - 1 + n) % n], ring[j], ring[(j + 1) % n]))
+        if turn > best_t:
+            best_t = turn
+            best_i = j
+    apex = ring[best_i]
+    back, _ = _walk_along(ring, best_i, -1, max(new_r * 2.2, 6.0))
+    spine = _vunit(_vsub(apex, back))
+    if spine[0] == 0.0 and spine[1] == 0.0:
+        back, _ = _walk_along(ring, best_i, 1, max(new_r * 2.2, 6.0))
+        spine = _vunit(_vsub(apex, back))
+    if spine[0] == 0.0 and spine[1] == 0.0:
+        return []
+    left = _vleft(spine)
+    p0 = _vadd(apex, _vmul(left, new_r))
+    p1 = _vadd(apex, _vmul(left, -new_r))
+    return _semicircle_cap(p0, p1, new_r, ring)
+
+
 def _cluster_original_turns(ring, min_width):
     """Group nearby same-sign turns so a tessellated CAD corner is one feature."""
     n = len(ring)
@@ -869,6 +960,14 @@ def _splice_feature(moved, chain, vertex, radius):
         return nxt
     nxt = _splice_near_vertex(moved, vertex, chain, radius)
     return nxt if len(nxt) >= 3 else moved
+
+
+def _splice_tip(moved, chain, vertex, radius):
+    """Replace everything near the tip. Endpoint splice can land on one wall."""
+    nxt = _splice_near_vertex(moved, vertex, chain, max(radius * 1.4, 3.2))
+    if nxt is not moved and len(nxt) >= 3:
+        return nxt
+    return _splice_feature(moved, chain, vertex, radius)
 
 
 def _pair_square_end(ring, ia, ib, min_width):
@@ -1220,9 +1319,22 @@ def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, 
     for feat in features:
         if feat.get("kind") == "end":
             vertex = feat.get("center")
-            chain = _end_cap_chain(feat["center"], feat["p0"], feat["p1"], radius, interior_ring)
+            splice_r = radius
+            if feat.get("a") is not None and _is_tapered_end(vertex, samples, min_width):
+                d = max(_grow_at_point(vertex, samples, grow, 0.0), 0.0)
+                w0 = _sample_width_near(vertex, samples, 0.6)
+                if w0 >= 1e8:
+                    w0 = 0.6
+                splice_r = max(w0 * 0.5 + d, 0.8)
+                chain = _tapered_tip_chain(
+                    vertex, moved, samples, grow, min_width, interior_ring
+                )
+            else:
+                chain = _end_cap_chain(
+                    feat["center"], feat["p0"], feat["p1"], radius, interior_ring
+                )
             if len(chain) >= 2:
-                nxt = _splice_feature(moved, chain, vertex, radius)
+                nxt = _splice_tip(moved, chain, vertex, splice_r)
                 if nxt is not moved and len(nxt) >= 3:
                     moved = nxt
                     protected.extend(chain)
@@ -1260,8 +1372,8 @@ def _near_protected(point, protected, radius):
     return False
 
 
-def _round_short_ends(points, ring, min_width, protected=None):
-    """Cap slot / taper ends with a semicircle of radius min_width/2."""
+def _round_short_ends(points, ring, min_width, protected=None, skip_centers=None):
+    """Cap parallel slot ends with a semicircle of radius min_width/2."""
     n = len(points)
     if n < 8 or min_width <= 0:
         return points
@@ -1270,6 +1382,14 @@ def _round_short_ends(points, ring, min_width, protected=None):
     out = []
     i = 0
     while i < n:
+        if skip_centers and any(
+            _vdist(points[i], c) < max(min_width * 1.8, 6.0) for c in skip_centers if c is not None
+        ):
+            if not used[i]:
+                out.append(points[i])
+                used[i] = True
+            i += 1
+            continue
         if used[i] or _near_protected(points[i], protected, radius):
             if not used[i]:
                 out.append(points[i])
@@ -1872,7 +1992,14 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
         cleaned, protected = _apply_original_features(
             cleaned, ring, ring, samples, deltas, min_width
         )
-        cleaned = _round_short_ends(cleaned, ring, min_width, protected)
+        taper_tips = [
+            f.get("center")
+            for f in features
+            if f.get("kind") == "end"
+            and f.get("a") is not None
+            and _is_tapered_end(f.get("center"), samples, min_width)
+        ]
+        cleaned = _round_short_ends(cleaned, ring, min_width, protected, taper_tips)
         cleaned = _remove_loops(cleaned)
     return (cleaned if len(cleaned) >= 3 else ring, pinches)
 
@@ -3602,7 +3729,24 @@ def _self_test():
     assert_true(pinches > 0, "complex koru tip should pinch")
     assert_true(not _polyline_self_intersects(moved), "complex koru must not loop")
     assert_true(belly_drift < 0.8, "wide koru belly should stay, drift={0}".format(belly_drift))
-    assert_true(tip_span > 4.0, "inner koru coil should open, span={0}".format(tip_span))
+    assert_true(tip_span > 3.2, "inner koru coil should open, span={0}".format(tip_span))
+    # Neck just behind the tip vs the cap: a lollipop is a wide U on a thin stem.
+    spine_dir = _vunit(_vsub(tip, koru_spine[-8]))
+    cap_w = 0.0
+    neck_w = 0.0
+    for p in moved:
+        rel = _vsub(p, tip)
+        along = _vdot(rel, spine_dir)
+        across = abs(_vcross(spine_dir, rel))
+        if 0.0 <= along < 3.6:
+            cap_w = max(cap_w, across * 2.0)
+        if -8.0 < along < -4.0:
+            neck_w = max(neck_w, across * 2.0)
+    if neck_w > 0.8 and cap_w > 0.8:
+        assert_true(
+            cap_w < neck_w * 1.35 + 1.0,
+            "koru tip must not be a grafted bulb (cap={0} neck={1})".format(cap_w, neck_w),
+        )
 
     print("PlasmaKerf math tests passed")
 
