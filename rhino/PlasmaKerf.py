@@ -3568,6 +3568,42 @@ def _self_test():
             flips += 1
     assert_true(flips == 0, "fair blend must not S-wave (flips={0})".format(flips))
 
+    # 2.5-turn tapered koru: thin inner coil opens, wide belly stays, no loop.
+    koru_spine = []
+    for i in range(121):
+        t = i / 120.0
+        a = math.pi * 0.20 + t * math.pi * 2.0 * 2.55
+        r = 82.0 * (0.20 ** t) + 5.5
+        koru_spine.append((130.0 + math.cos(a) * r, 120.0 + math.sin(a) * r))
+    koru_left = []
+    koru_right = []
+    for i, p in enumerate(koru_spine):
+        t = i / 120.0
+        half = (12.0 * (1.0 - t) ** 1.4 + 0.28) * 0.5
+        nxt = koru_spine[i + 1] if i < 120 else koru_spine[i]
+        prv = koru_spine[i - 1] if i else koru_spine[i]
+        tan = _vunit(_vsub(nxt, p) if i < 120 else _vsub(p, prv))
+        nrm = _vleft(tan)
+        koru_left.append(_vadd(p, _vmul(nrm, half)))
+        koru_right.append(_vadd(p, _vmul(nrm, -half)))
+    koru = koru_left + list(reversed(koru_right))
+    moved, pinches = ensure_min_width_ring(koru, 6.0)
+    belly = max(koru, key=lambda q: q[0])
+    tip = koru_spine[-1]
+    belly_drift = min(_vdist(belly, q) for q in moved)
+    tip_span = 0.0
+    for i, a in enumerate(moved):
+        if _vdist(a, tip) > 10.0:
+            continue
+        for b in moved[i + 1 :]:
+            if _vdist(b, tip) > 10.0:
+                continue
+            tip_span = max(tip_span, _vdist(a, b))
+    assert_true(pinches > 0, "complex koru tip should pinch")
+    assert_true(not _polyline_self_intersects(moved), "complex koru must not loop")
+    assert_true(belly_drift < 0.8, "wide koru belly should stay, drift={0}".format(belly_drift))
+    assert_true(tip_span > 4.0, "inner koru coil should open, span={0}".format(tip_span))
+
     print("PlasmaKerf math tests passed")
 
 
