@@ -349,7 +349,7 @@ function landingGrow(center: Point, samples: WidthSample[], deltas: number[]): n
   const vals: number[] = [];
   for (let i = 0; i < samples.length; i++) {
     const d = dist(samples[i].point, center);
-    if (d < 5 || d > 16) continue;
+    if (d < 3 || d > 8) continue;
     if (i < deltas.length) vals.push(deltas[i]);
   }
   if (!vals.length) {
@@ -407,28 +407,20 @@ function findTaperedTips(ring: Point[], samples: WidthSample[], minWidth: number
   return tips;
 }
 
-function walkAlong(points: Point[], start: number, step: number, distance: number): Point {
-  const n = points.length;
-  let acc = 0;
-  let i = start;
-  for (let guard = 0; guard < n && acc < distance - 1e-9; guard++) {
-    const j = wrapIndex(i + step, n);
-    const seg = dist(points[i], points[j]);
-    if (seg < 1e-12) {
-      i = j;
-      continue;
-    }
-    if (acc + seg >= distance) {
-      const t = (distance - acc) / seg;
-      return {
-        x: points[i].x + (points[j].x - points[i].x) * t,
-        y: points[i].y + (points[j].y - points[i].y) * t,
-      };
-    }
-    acc += seg;
-    i = j;
-  }
-  return points[i];
+function wallOutward(a: Point, b: Point, ring: Point[]): Point {
+  const tangent = unit(sub(b, a));
+  let inward = rotateLeft(tangent);
+  const mid = midpoint(a, b);
+  if (!pointInPolygon(add(mid, mul(inward, 0.35)), ring)) inward = mul(inward, -1);
+  return mul(inward, -1);
+}
+
+function vertexRoundJoin(a: Point, b: Point, c: Point, radius: number, ring: Point[]): Point[] {
+  if (radius < 0.04) return [b];
+  const p0 = add(b, mul(wallOutward(a, b, ring), radius));
+  const p1 = add(b, mul(wallOutward(b, c, ring), radius));
+  if (dist(p0, p1) < 0.04) return [p0];
+  return [p0, ...exteriorArc(b, p0, p1, radius, ring), p1];
 }
 
 function parallelTipChain(
@@ -436,51 +428,35 @@ function parallelTipChain(
   ring: Point[],
   samples: WidthSample[],
   deltas: number[],
-  moved: Point[],
+  _moved: Point[],
 ): Point[] {
   const n = ring.length;
   if (n < 6) return [];
   const i0 = nearestIndex(ring, center);
-  let bestI = i0;
-  let bestT = -1;
-  for (let k = -16; k <= 16; k++) {
-    const j = wrapIndex(i0 + k, n);
-    const turn = Math.abs(turnAt(ring[wrapIndex(j - 1, n)], ring[j], ring[wrapIndex(j + 1, n)]));
-    if (turn > bestT) {
-      bestT = turn;
-      bestI = j;
-    }
-  }
-  const apex = ring[bestI];
-  const g = landingGrow(apex, samples, deltas);
+  const g = landingGrow(ring[i0], samples, deltas);
   if (g < 0.04) return [];
-  let back = walkAlong(ring, bestI, -1, Math.max(g * 2.4, 5));
-  let spine = unit(sub(apex, back));
-  if (spine.x === 0 && spine.y === 0) {
-    back = walkAlong(ring, bestI, 1, Math.max(g * 2.4, 5));
-    spine = unit(sub(apex, back));
-  }
-  if (spine.x === 0 && spine.y === 0) return [];
-  const reach = Math.max(g * 2.2, 4.5);
-  const source = moved.length >= 6 ? moved : ring;
-  let left: { along: number; p: Point } | null = null;
-  let right: { along: number; p: Point } | null = null;
-  for (const p of source) {
-    const rel = sub(p, apex);
-    const along = rel.x * spine.x + rel.y * spine.y;
-    const across = spine.x * rel.y - spine.y * rel.x;
-    if (along > -0.5 || along < -reach * 1.5) continue;
-    if (across > 0.12 && across < 4) {
-      if (!left || along > left.along) left = { along, p };
-    } else if (across < -0.12 && across > -4) {
-      if (!right || along > right.along) right = { along, p };
+  let ia = -1;
+  let ib = -1;
+  let best = Infinity;
+  for (let k = -10; k <= 10; k++) {
+    const i = wrapIndex(i0 + k, n);
+    const j = wrapIndex(i + 1, n);
+    const edge = dist(ring[i], ring[j]);
+    if (edge < 0.04 || edge > 4) continue;
+    const turnI = Math.abs(turnAt(ring[wrapIndex(i - 1, n)], ring[i], ring[j]));
+    const turnJ = Math.abs(turnAt(ring[i], ring[j], ring[wrapIndex(j + 1, n)]));
+    if (turnI < 0.6 || turnJ < 0.6) continue;
+    if (edge < best) {
+      best = edge;
+      ia = i;
+      ib = j;
     }
   }
-  if (!left || !right) return [];
-  const chord = dist(left.p, right.p);
-  if (chord < 0.35) return [];
-  const mid = midpoint(left.p, right.p);
-  return [left.p, ...exteriorArc(mid, left.p, right.p, chord * 0.5, ring), right.p];
+  if (ia < 0) return [];
+  const left = vertexRoundJoin(ring[wrapIndex(ia - 1, n)], ring[ia], ring[ib], g, ring);
+  const right = vertexRoundJoin(ring[ia], ring[ib], ring[wrapIndex(ib + 1, n)], g, ring);
+  if (left.length < 2 || right.length < 2) return [];
+  return cleanPoints([...left, ...right.slice(1)], false, 0.02);
 }
 
 function replaceSpan(moved: Point[], start: number, end: number, chain: Point[]): Point[] {
@@ -543,9 +519,9 @@ function fixTaperedTips(
   for (const tip of tips) {
     const chain = parallelTipChain(tip, ring, samples, deltas, next);
     if (chain.length < 2) continue;
-    if (Math.min(...chain.map((p) => dist(p, tip))) > 2.8) continue;
-    const g = Math.max(landingGrow(tip, samples, deltas), 3.2);
-    const spliced = spliceNearVertex(next, tip, chain, g);
+    const g = Math.max(landingGrow(tip, samples, deltas), 2.4);
+    if (Math.min(...chain.map((p) => dist(p, tip))) > g + 2.2) continue;
+    const spliced = spliceNearVertex(next, tip, chain, Math.max(g, 2.8));
     if (spliced.length >= 3) next = spliced;
   }
   return next;
@@ -589,6 +565,13 @@ export function ensureMinWidth(
   const pinches = thinRuns(deltas.map((d) => d > 0.04));
 
   const taperTips = findTaperedTips(ring, samples, minWidth);
+  for (const tip of taperTips) {
+    const g = landingGrow(tip, samples, deltas);
+    if (g < 0.04) continue;
+    for (let i = 0; i < deltas.length; i++) {
+      if (dist(samples[i].point, tip) < 5) deltas[i] = Math.min(deltas[i], g);
+    }
+  }
   const moved: Point[] = [];
   for (let i = 0; i < samples.length; i++) {
     const prev = samples[(i - 1 + samples.length) % samples.length];
@@ -600,8 +583,11 @@ export function ensureMinWidth(
     const delta = deltas[i];
     const pOff = offsetPoint(curr, delta, ring);
 
+    const tinyEdge =
+      dist(prev.point, curr.point) < minWidth * 0.4 || dist(curr.point, next.point) < minWidth * 0.4;
     const nearTaper = taperTips.some((tip) => dist(curr.point, tip) < 8);
-    const isCorner = !nearTaper && Math.abs(turn) > 0.35 && Math.abs(turn) < 2.2 && delta > 0.05;
+    const isCorner =
+      !nearTaper && !tinyEdge && Math.abs(turn) > 0.35 && Math.abs(turn) < 2.2 && delta > 0.05;
     if (isCorner && moved.length) {
       const from = offsetPoint({ ...curr, inward: prev.inward }, delta, ring);
       const to = offsetPoint(curr, delta, ring);

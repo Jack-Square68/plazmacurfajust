@@ -692,7 +692,7 @@ def _landing_grow(center, samples, grow):
     vals = []
     for i, sample in enumerate(samples):
         dist = _vdist(sample["point"], center)
-        if dist < 5.0 or dist > 16.0:
+        if dist < 3.0 or dist > 8.0:
             continue
         if i < len(grow):
             vals.append(grow[i])
@@ -784,55 +784,36 @@ def _walk_until_radius(points, start, step, center, radius):
 
 
 def _tapered_tip_chain(center, moved, samples, grow, min_width, ring):
-    """Thicker copy of the original scroll tip, closed on the grown stem.
-
-    Picks opposite walls of this ribbon (not the next coil) and joins them
-    with one semicircle of half the stem chord.
-    """
+    """Parallel of the original scroll tip — two round joins of the stem grow."""
     if center is None or len(ring) < 6:
         return []
     n = len(ring)
     i0, _ = _nearest_index(ring, center)
-    best_i, best_t = i0, -1.0
-    for k in range(-16, 17):
-        j = (i0 + k + n) % n
-        turn = abs(_turn_at(ring[(j - 1 + n) % n], ring[j], ring[(j + 1) % n]))
-        if turn > best_t:
-            best_t = turn
-            best_i = j
-    apex = ring[best_i]
-    g = _landing_grow(apex, samples, grow)
+    g = _landing_grow(ring[i0], samples, grow)
     if g < 0.04:
         return []
-    back, _ = _walk_along(ring, best_i, -1, max(g * 2.4, 5.0))
-    spine = _vunit(_vsub(apex, back))
-    if spine[0] == 0.0 and spine[1] == 0.0:
-        back, _ = _walk_along(ring, best_i, 1, max(g * 2.4, 5.0))
-        spine = _vunit(_vsub(apex, back))
-    if spine[0] == 0.0 and spine[1] == 0.0:
-        return []
-    reach = max(g * 2.2, 4.5)
-    source = moved if moved and len(moved) >= 6 else ring
-    left = right = None
-    for p in source:
-        rel = _vsub(p, apex)
-        along = _vdot(rel, spine)
-        across = _vcross(spine, rel)
-        if along > -0.5 or along < -reach * 1.5:
+    ia = ib = -1
+    best = 1e9
+    for k in range(-10, 11):
+        i = (i0 + k + n) % n
+        j = (i + 1) % n
+        edge = _vdist(ring[i], ring[j])
+        if edge < 0.04 or edge > 4.0:
             continue
-        if 0.12 < across < 4.0:
-            if left is None or along > left[0]:
-                left = (along, p)
-        elif -4.0 < across < -0.12:
-            if right is None or along > right[0]:
-                right = (along, p)
-    if left is None or right is None:
+        turn_i = abs(_turn_at(ring[(i - 1 + n) % n], ring[i], ring[j]))
+        turn_j = abs(_turn_at(ring[i], ring[j], ring[(j + 1) % n]))
+        if turn_i < 0.6 or turn_j < 0.6:
+            continue
+        if edge < best:
+            best = edge
+            ia, ib = i, j
+    if ia < 0:
         return []
-    p0, p1 = left[1], right[1]
-    chord = _vdist(p0, p1)
-    if chord < 0.35:
+    left = _vertex_round_join(ring[(ia - 1 + n) % n], ring[ia], ring[ib], g, ring)
+    right = _vertex_round_join(ring[ia], ring[ib], ring[(ib + 1) % n], g, ring)
+    if len(left) < 2 or len(right) < 2:
         return []
-    return _semicircle_cap(p0, p1, chord * 0.5, ring)
+    return _clean_ring(left + right[1:], 0.02)
 
 
 def _cluster_original_turns(ring, min_width):
@@ -1435,9 +1416,10 @@ def _apply_original_features(moved, feature_ring, interior_ring, samples, grow, 
         )
         if len(chain) < 2:
             continue
-        if min(_vdist(p, vertex) for p in chain) > 2.8:
+        g = max(_landing_grow(vertex, samples, grow), 0.8)
+        if min(_vdist(p, vertex) for p in chain) > g + 2.2:
             continue
-        splice_r = max(_landing_grow(vertex, samples, grow), 3.2)
+        splice_r = max(g, 2.8)
         nxt = _splice_near_vertex(moved, vertex, chain, splice_r)
         if nxt is moved or len(nxt) < 3:
             nxt = _splice_tip(moved, chain, vertex, splice_r)
@@ -2096,6 +2078,14 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
         )
         if rebuilt is not None:
             return (rebuilt, pinches)
+    for vertex in _find_tapered_tips(ring, samples, min_width):
+        g = _landing_grow(vertex, samples, deltas)
+        if g < 0.04:
+            continue
+        for i in range(len(deltas)):
+            if _vdist(samples[i]["point"], vertex) < 5.0:
+                if deltas[i] > g:
+                    deltas[i] = g
     moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
     cleaned = _remove_loops(_clean_ring(moved, 0.02))
     # Only rebuild the whole outline when every pinch feature is a fillet.
