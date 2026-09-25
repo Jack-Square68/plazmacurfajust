@@ -152,7 +152,7 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   assert(!!b && b.maxY - b.minY > 5.4 && b.maxY - b.minY < 6.6, `open stadium height ~6, got ${b ? b.maxY - b.minY : "?"}`);
 }
 
-// Tapered koru: wide belly stays, tip rounds to min width, curve stays fair.
+// Tapered koru: wide belly stays, tip is a thicker parallel — not a MinWidth bulb.
 {
   const koruPts = makeKoru();
   assert(koruPts.length > 20, "koru preset should exist");
@@ -166,9 +166,44 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   assert(next.maxX - next.minX < original.maxX - original.minX + minWidth + 4, "koru should not balloon");
   assert(grown.pinches > 0, "tapered koru tip should be under min width");
 
-  const tip = koruPts.reduce((best, p) => (p.x < best.x ? p : best), koruPts[0]);
-  const tipSpan = localSpan(outline, { x: tip.x - 1, y: tip.y }, 10);
-  assert(tipSpan > minWidth * 0.7, `rounded tip should be near min width, got ${tipSpan}`);
+  let tipEdge = Infinity;
+  let tip = koruPts[0];
+  for (let i = 0; i < koruPts.length; i++) {
+    const a = koruPts[i];
+    const b = koruPts[(i + 1) % koruPts.length];
+    const edge = dist(a, b);
+    if (edge < tipEdge) {
+      tipEdge = edge;
+      tip = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    }
+  }
+  const tipSpan = localSpan(outline, tip, 10);
+  assert(tipSpan > 2.0, `tapered tip should thicken, got ${tipSpan}`);
+  const closest = Math.min(...outline.map((p) => dist(p, tip)));
+  assert(closest < 3.2, `koru tip should hug the original, d=${closest}`);
+  const tipTurn = maxTurnWhere(outline, (p) => dist(p, tip) < 12);
+  assert(tipTurn < 0.8, `koru tip must not keep a house knuckle, turn=${tipTurn}`);
+
+  const inward = koruPts.reduce((best, p) => {
+    const d = dist(p, tip);
+    return d > 6 && d < 12 && d < dist(best, tip) ? p : best;
+  }, koruPts[0]);
+  const spine = { x: tip.x - inward.x, y: tip.y - inward.y };
+  const sl = Math.hypot(spine.x, spine.y) || 1;
+  const sx = spine.x / sl;
+  const sy = spine.y / sl;
+  let capW = 0;
+  let neckW = 0;
+  for (const p of outline) {
+    if (dist(p, tip) > 14) continue;
+    const along = (p.x - tip.x) * sx + (p.y - tip.y) * sy;
+    const across = Math.abs((p.x - tip.x) * sy - (p.y - tip.y) * sx);
+    if (along >= 0 && along < 4) capW = Math.max(capW, across * 2);
+    if (along < -5 && along > -10) neckW = Math.max(neckW, across * 2);
+  }
+  assert(neckW > 0.8, `koru neck should be measurable, neck=${neckW}`);
+  assert(capW > 0.8, `koru cap should be measurable, cap=${capW}`);
+  assert(capW < neckW * 1.12 + 0.35, `koru tip must not be a grafted bulb (cap=${capW} neck=${neckW})`);
 
   const midX = (original.minX + original.maxX) * 0.5;
   const sharp = maxTurnWhere(outline, (p) => p.x <= midX);
