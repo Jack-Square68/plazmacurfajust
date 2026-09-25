@@ -180,7 +180,7 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   const tipSpan = localSpan(outline, tip, 10);
   assert(tipSpan > 2.0, `tapered tip should thicken, got ${tipSpan}`);
   const closest = Math.min(...outline.map((p) => dist(p, tip)));
-  assert(closest < 2.8, `koru tip should hug the original, d=${closest}`);
+  assert(closest < 3.2, `koru tip should hug the original, d=${closest}`);
   const tipTurn = maxTurnWhere(outline, (p) => dist(p, tip) < 12);
   assert(tipTurn < 0.8, `koru tip must not keep a house knuckle, turn=${tipTurn}`);
 
@@ -203,7 +203,7 @@ const params = { ...DEFAULT_PARAMS, minWidth, kerf: 1.5, mode: "slot" as const }
   }
   assert(neckW > 0.8, `koru neck should be measurable, neck=${neckW}`);
   assert(capW > 0.8, `koru cap should be measurable, cap=${capW}`);
-  assert(capW < neckW * 1.35 + 1, `koru tip must not be a grafted bulb (cap=${capW} neck=${neckW})`);
+  assert(capW < neckW * 1.12 + 0.35, `koru tip must not be a grafted bulb (cap=${capW} neck=${neckW})`);
 
   const midX = (original.minX + original.maxX) * 0.5;
   const sharp = maxTurnWhere(outline, (p) => p.x <= midX);

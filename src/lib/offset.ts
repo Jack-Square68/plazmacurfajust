@@ -349,7 +349,7 @@ function landingGrow(center: Point, samples: WidthSample[], deltas: number[]): n
   const vals: number[] = [];
   for (let i = 0; i < samples.length; i++) {
     const d = dist(samples[i].point, center);
-    if (d < 3 || d > 8) continue;
+    if (d < 1.5 || d > 5) continue;
     if (i < deltas.length) vals.push(deltas[i]);
   }
   if (!vals.length) {
@@ -361,6 +361,41 @@ function landingGrow(center: Point, samples: WidthSample[], deltas: number[]): n
   }
   vals.sort((a, b) => a - b);
   return Math.max(vals[Math.floor(vals.length / 2)], 0);
+}
+
+/** Short convex-convex end of a ribbon — the original tip edge. */
+function findShortTipEdge(center: Point, ring: Point[]): [number, number] | null {
+  const n = ring.length;
+  if (n < 6) return null;
+  const i0 = nearestIndex(ring, center);
+  let ia = -1;
+  let ib = -1;
+  let best = Infinity;
+  for (let k = -10; k <= 10; k++) {
+    const i = wrapIndex(i0 + k, n);
+    const j = wrapIndex(i + 1, n);
+    const edge = dist(ring[i], ring[j]);
+    if (edge < 0.04 || edge > 4) continue;
+    const turnI = Math.abs(turnAt(ring[wrapIndex(i - 1, n)], ring[i], ring[j]));
+    const turnJ = Math.abs(turnAt(ring[i], ring[j], ring[wrapIndex(j + 1, n)]));
+    if (turnI < 0.6 || turnJ < 0.6) continue;
+    if (edge < best) {
+      best = edge;
+      ia = i;
+      ib = j;
+    }
+  }
+  return ia < 0 ? null : [ia, ib];
+}
+
+/** Ribbon width at a taper tip, ignoring the spine-ray that shoots down the scroll. */
+function ribbonWidthNearTip(point: Point, samples: WidthSample[], minWidth: number): number {
+  let best = Infinity;
+  for (const sample of samples) {
+    if (!Number.isFinite(sample.width) || sample.width >= minWidth * 0.95) continue;
+    if (dist(sample.point, point) <= 6 && sample.width < best) best = sample.width;
+  }
+  return best;
 }
 
 function findTaperedTips(ring: Point[], samples: WidthSample[], minWidth: number): Point[] {
@@ -407,20 +442,30 @@ function findTaperedTips(ring: Point[], samples: WidthSample[], minWidth: number
   return tips;
 }
 
-function wallOutward(a: Point, b: Point, ring: Point[]): Point {
-  const tangent = unit(sub(b, a));
-  let inward = rotateLeft(tangent);
+function originalTipArc(ring: Point[], ia: number, ib: number): Point[] {
+  const a = ring[ia];
+  const b = ring[ib];
   const mid = midpoint(a, b);
-  if (!pointInPolygon(add(mid, mul(inward, 0.35)), ring)) inward = mul(inward, -1);
-  return mul(inward, -1);
+  const r = dist(a, b) * 0.5;
+  if (r < 0.04) return [a, b];
+  return cleanPoints([a, ...exteriorArc(mid, a, b, r, ring), b], false, 0.02);
 }
 
-function vertexRoundJoin(a: Point, b: Point, c: Point, radius: number, ring: Point[]): Point[] {
-  if (radius < 0.04) return [b];
-  const p0 = add(b, mul(wallOutward(a, b, ring), radius));
-  const p1 = add(b, mul(wallOutward(b, c, ring), radius));
-  if (dist(p0, p1) < 0.04) return [p0];
-  return [p0, ...exteriorArc(b, p0, p1, radius, ring), p1];
+function fairOriginalTaperTips(ring: Point[], tips: Point[]): Point[] {
+  let next = ring;
+  const edges: [number, number][] = [];
+  for (const tip of tips) {
+    const edge = findShortTipEdge(tip, next);
+    if (edge) edges.push(edge);
+  }
+  edges.sort((a, b) => Math.min(b[0], b[1]) - Math.min(a[0], a[1]));
+  for (const [ia, ib] of edges) {
+    if (ia >= next.length || ib >= next.length) continue;
+    const chain = originalTipArc(next, ia, ib);
+    if (chain.length < 3) continue;
+    next = replaceSpan(next, ia, ib, chain);
+  }
+  return cleanPoints(next, true, 0.02);
 }
 
 function parallelTipChain(
@@ -435,28 +480,19 @@ function parallelTipChain(
   const i0 = nearestIndex(ring, center);
   const g = landingGrow(ring[i0], samples, deltas);
   if (g < 0.04) return [];
-  let ia = -1;
-  let ib = -1;
-  let best = Infinity;
-  for (let k = -10; k <= 10; k++) {
-    const i = wrapIndex(i0 + k, n);
-    const j = wrapIndex(i + 1, n);
-    const edge = dist(ring[i], ring[j]);
-    if (edge < 0.04 || edge > 4) continue;
-    const turnI = Math.abs(turnAt(ring[wrapIndex(i - 1, n)], ring[i], ring[j]));
-    const turnJ = Math.abs(turnAt(ring[i], ring[j], ring[wrapIndex(j + 1, n)]));
-    if (turnI < 0.6 || turnJ < 0.6) continue;
-    if (edge < best) {
-      best = edge;
-      ia = i;
-      ib = j;
-    }
-  }
-  if (ia < 0) return [];
-  const left = vertexRoundJoin(ring[wrapIndex(ia - 1, n)], ring[ia], ring[ib], g, ring);
-  const right = vertexRoundJoin(ring[ia], ring[ib], ring[wrapIndex(ib + 1, n)], g, ring);
-  if (left.length < 2 || right.length < 2) return [];
-  return cleanPoints([...left, ...right.slice(1)], false, 0.02);
+  const edge = findShortTipEdge(center, ring);
+  if (!edge) return [];
+  const [ia, ib] = edge;
+  const mid = midpoint(ring[ia], ring[ib]);
+  const r0 = dist(ring[ia], ring[ib]) * 0.5;
+  const r = r0 + g;
+  const u0 = unit(sub(ring[ia], mid));
+  const u1 = unit(sub(ring[ib], mid));
+  if (r < 0.04 || (u0.x === 0 && u0.y === 0) || (u1.x === 0 && u1.y === 0)) return [];
+  const p0 = add(mid, mul(u0, r));
+  const p1 = add(mid, mul(u1, r));
+  if (dist(p0, p1) < 0.04) return [p0];
+  return cleanPoints([p0, ...exteriorArc(mid, p0, p1, r, ring), p1], false, 0.02);
 }
 
 function replaceSpan(moved: Point[], start: number, end: number, chain: Point[]): Point[] {
@@ -538,10 +574,23 @@ export function ensureMinWidth(
   minWidth: number,
   _join: JoinStyle = "round",
 ): { outline: Point[][]; pinches: number; centerlines: Point[][] } {
-  const ring = ensureCcw(cleanPoints(points, true));
-  if (ring.length < 3 || minWidth <= 0) {
-    return { outline: ring.length >= 3 ? [ring] : [], pinches: 0, centerlines: [] };
+  const rawRing = ensureCcw(cleanPoints(points, true));
+  if (rawRing.length < 3 || minWidth <= 0) {
+    return { outline: rawRing.length >= 3 ? [rawRing] : [], pinches: 0, centerlines: [] };
   }
+
+  const probeSpacing = Math.min(
+    0.4,
+    Math.max(0.16, polylineLength(rawRing, true) / 720, minWidth / 24),
+  );
+  const probePrefix = edgePrefix(rawRing);
+  const probe: WidthSample[] = sampleBoundary(rawRing, probeSpacing).map((s) => ({
+    ...s,
+    width: localWidth(s.point, s.inward, rawRing, s.edge, minWidth, probePrefix),
+  }));
+  const taperTips = findTaperedTips(rawRing, probe, minWidth);
+  const ring = fairOriginalTaperTips(rawRing, taperTips);
+  if (ring.length < 3) return { outline: [rawRing], pinches: 0, centerlines: [] };
 
   const perimeter = polylineLength(ring, true);
   const target = Math.min(0.4, Math.max(0.16, minWidth / 24));
@@ -552,10 +601,15 @@ export function ensureMinWidth(
     width: localWidth(s.point, s.inward, ring, s.edge, minWidth, prefix),
   }));
   if (samples.length < 3) return { outline: [ring], pinches: 0, centerlines: [] };
-
-  const rawDelta = samples.map((s) =>
-    Number.isFinite(s.width) ? Math.max(0, (minWidth - s.width) / 2) : 0,
-  );
+  const rawDelta = samples.map((s) => {
+    let width = s.width;
+    const nearTip = taperTips.some((tip) => dist(s.point, tip) < 5);
+    if (nearTip && (!Number.isFinite(width) || width >= minWidth * 0.95)) {
+      const ribbon = ribbonWidthNearTip(s.point, samples, minWidth);
+      if (Number.isFinite(ribbon) && ribbon < minWidth) width = ribbon;
+    }
+    return Number.isFinite(width) ? Math.max(0, (minWidth - width) / 2) : 0;
+  });
   if (!rawDelta.some((d) => d > 1e-4)) {
     return { outline: [ring], pinches: 0, centerlines: [] };
   }
@@ -564,12 +618,11 @@ export function ensureMinWidth(
   const deltas = smoothClosedValues(rawDelta, sigma);
   const pinches = thinRuns(deltas.map((d) => d > 0.04));
 
-  const taperTips = findTaperedTips(ring, samples, minWidth);
   for (const tip of taperTips) {
     const g = landingGrow(tip, samples, deltas);
     if (g < 0.04) continue;
     for (let i = 0; i < deltas.length; i++) {
-      if (dist(samples[i].point, tip) < 5) deltas[i] = Math.min(deltas[i], g);
+      if (dist(samples[i].point, tip) < 6) deltas[i] = g;
     }
   }
   const moved: Point[] = [];

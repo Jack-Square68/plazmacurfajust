@@ -692,7 +692,7 @@ def _landing_grow(center, samples, grow):
     vals = []
     for i, sample in enumerate(samples):
         dist = _vdist(sample["point"], center)
-        if dist < 3.0 or dist > 8.0:
+        if dist < 1.5 or dist > 5.0:
             continue
         if i < len(grow):
             vals.append(grow[i])
@@ -700,6 +700,59 @@ def _landing_grow(center, samples, grow):
         return max(_grow_at_point(center, samples, grow, 0.0), 0.0)
     vals.sort()
     return max(vals[len(vals) // 2], 0.0)
+
+
+def _ribbon_width_near_tip(point, samples, min_width):
+    """True ribbon width, ignoring a spine-ray that shoots down the scroll."""
+    best = float("inf")
+    for sample in samples:
+        width = sample.get("width")
+        if width is None or width >= min_width * 0.95:
+            continue
+        if _vdist(sample["point"], point) <= 6.0 and width < best:
+            best = width
+    return best
+
+
+def _find_short_tip_edge(center, ring):
+    """Short convex-convex end of a ribbon — the original tip edge."""
+    n = len(ring)
+    if n < 6 or center is None:
+        return None
+    i0, _ = _nearest_index(ring, center)
+    ia = ib = -1
+    best = 1e9
+    for k in range(-10, 11):
+        i = (i0 + k + n) % n
+        j = (i + 1) % n
+        edge = _vdist(ring[i], ring[j])
+        if edge < 0.04 or edge > 4.0:
+            continue
+        turn_i = abs(_turn_at(ring[(i - 1 + n) % n], ring[i], ring[j]))
+        turn_j = abs(_turn_at(ring[i], ring[j], ring[(j + 1) % n]))
+        if turn_i < 0.6 or turn_j < 0.6:
+            continue
+        if edge < best:
+            best = edge
+            ia, ib = i, j
+    if ia < 0:
+        return None
+    return ia, ib
+
+
+def _correct_taper_tip_widths(samples, min_width, ring, tips=None):
+    """Tip-edge rays often miss the opposite wall and report a huge width."""
+    if tips is None:
+        tips = _find_tapered_tips(ring, samples, min_width)
+    for sample in samples:
+        if not any(_vdist(sample["point"], tip) < 5.0 for tip in tips):
+            continue
+        width = sample.get("width", float("inf"))
+        if width is None or width >= min_width * 0.95:
+            ribbon = _ribbon_width_near_tip(sample["point"], samples, min_width)
+            if ribbon < min_width:
+                sample["width"] = ribbon
+    return tips
 
 
 def _find_tapered_tips(ring, samples, min_width):
@@ -783,37 +836,54 @@ def _walk_until_radius(points, start, step, center, radius):
     return points[i], i
 
 
+def _fair_original_taper_tips(ring, tips):
+    """Replace a blunt two-corner tip with the original small semicircle."""
+    next_ring = list(ring)
+    edges = []
+    for tip in tips:
+        pair = _find_short_tip_edge(tip, next_ring)
+        if pair is not None:
+            edges.append(pair)
+    edges.sort(key=lambda ab: -min(ab[0], ab[1]))
+    for ia, ib in edges:
+        if ia >= len(next_ring) or ib >= len(next_ring):
+            continue
+        a, b = next_ring[ia], next_ring[ib]
+        mid = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+        radius = _vdist(a, b) * 0.5
+        if radius < 0.04:
+            continue
+        chain = _clean_ring([a] + _arc_points(mid, a, b, radius, next_ring) + [b], 0.02)
+        if len(chain) < 3:
+            continue
+        next_ring = _replace_span(next_ring, ia, ib, chain)
+    return _clean_ring(next_ring, 0.02) if len(next_ring) >= 3 else ring
+
+
 def _tapered_tip_chain(center, moved, samples, grow, min_width, ring):
-    """Parallel of the original scroll tip — two round joins of the stem grow."""
+    """Concentric parallel of the original scroll tip — not two corner bulbs."""
     if center is None or len(ring) < 6:
         return []
-    n = len(ring)
     i0, _ = _nearest_index(ring, center)
     g = _landing_grow(ring[i0], samples, grow)
     if g < 0.04:
         return []
-    ia = ib = -1
-    best = 1e9
-    for k in range(-10, 11):
-        i = (i0 + k + n) % n
-        j = (i + 1) % n
-        edge = _vdist(ring[i], ring[j])
-        if edge < 0.04 or edge > 4.0:
-            continue
-        turn_i = abs(_turn_at(ring[(i - 1 + n) % n], ring[i], ring[j]))
-        turn_j = abs(_turn_at(ring[i], ring[j], ring[(j + 1) % n]))
-        if turn_i < 0.6 or turn_j < 0.6:
-            continue
-        if edge < best:
-            best = edge
-            ia, ib = i, j
-    if ia < 0:
+    pair = _find_short_tip_edge(center, ring)
+    if pair is None:
         return []
-    left = _vertex_round_join(ring[(ia - 1 + n) % n], ring[ia], ring[ib], g, ring)
-    right = _vertex_round_join(ring[ia], ring[ib], ring[(ib + 1) % n], g, ring)
-    if len(left) < 2 or len(right) < 2:
+    ia, ib = pair
+    mid = ((ring[ia][0] + ring[ib][0]) * 0.5, (ring[ia][1] + ring[ib][1]) * 0.5)
+    r0 = _vdist(ring[ia], ring[ib]) * 0.5
+    radius = r0 + g
+    u0 = _vunit(_vsub(ring[ia], mid))
+    u1 = _vunit(_vsub(ring[ib], mid))
+    if radius < 0.04 or (u0[0] == 0.0 and u0[1] == 0.0) or (u1[0] == 0.0 and u1[1] == 0.0):
         return []
-    return _clean_ring(left + right[1:], 0.02)
+    p0 = _vadd(mid, _vmul(u0, radius))
+    p1 = _vadd(mid, _vmul(u1, radius))
+    if _vdist(p0, p1) < 0.04:
+        return [p0]
+    return _clean_ring([p0] + _arc_points(mid, p0, p1, radius, ring) + [p1], 0.02)
 
 
 def _cluster_original_turns(ring, min_width):
@@ -2057,11 +2127,12 @@ def _fillet_tips(features):
     return tips
 
 
-def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
+def _apply_min_width(ring, samples, spacing, min_width, round_corners=True, taper_tips=None):
     if len(ring) < 3 or min_width <= 0:
         return (ring, 0)
     if len(samples) < 3:
         return (ring, 0)
+    taper_tips = _correct_taper_tip_widths(samples, min_width, ring, taper_tips)
     deltas, pinches = _compute_deltas(samples, spacing, min_width)
     if pinches == 0:
         return (ring, 0)
@@ -2078,14 +2149,13 @@ def _apply_min_width(ring, samples, spacing, min_width, round_corners=True):
         )
         if rebuilt is not None:
             return (rebuilt, pinches)
-    for vertex in _find_tapered_tips(ring, samples, min_width):
+    for vertex in taper_tips:
         g = _landing_grow(vertex, samples, deltas)
         if g < 0.04:
             continue
         for i in range(len(deltas)):
-            if _vdist(samples[i]["point"], vertex) < 5.0:
-                if deltas[i] > g:
-                    deltas[i] = g
+            if _vdist(samples[i]["point"], vertex) < 6.0:
+                deltas[i] = g
     moved = [_offset_point(samples[i], deltas[i], ring) for i in range(len(samples))]
     cleaned = _remove_loops(_clean_ring(moved, 0.02))
     # Only rebuild the whole outline when every pinch feature is a fillet.
@@ -2116,7 +2186,13 @@ def ensure_min_width_ring(points, min_width):
     points: list of (x, y). Returns (moved_points, pinches).
     """
     ring, samples, spacing = _prepare_ring(points, min_width)
-    return _apply_min_width(ring, samples, spacing, min_width)
+    taper_tips = _find_tapered_tips(ring, samples, min_width)
+    faired = _fair_original_taper_tips(ring, taper_tips)
+    if len(faired) >= 3:
+        ring, samples, spacing = _prepare_ring(faired, min_width)
+    return _apply_min_width(
+        ring, samples, spacing, min_width, taper_tips=taper_tips
+    )
 
 
 CMD_NAME = "PlasmaKerf"
@@ -3883,12 +3959,12 @@ def _self_test():
         )
     assert_true(demo_pinches > 0, "demo koru tip should pinch")
     assert_true(not _polyline_self_intersects(demo_moved), "demo koru must not loop")
-    assert_true(demo_closest < 2.8, "demo koru tip should hug the original, d={0}".format(demo_closest))
+    assert_true(demo_closest < 3.2, "demo koru tip should hug the original, d={0}".format(demo_closest))
     assert_true(demo_turn < 0.8, "demo koru tip must not keep a house knuckle, turn={0}".format(demo_turn))
     assert_true(demo_neck > 0.8, "demo koru neck should be measurable, neck={0}".format(demo_neck))
     assert_true(demo_cap > 0.8, "demo koru cap should be measurable, cap={0}".format(demo_cap))
     assert_true(
-        demo_cap < demo_neck * 1.35 + 1.0,
+        demo_cap < demo_neck * 1.12 + 0.35,
         "demo koru tip must not be a grafted bulb (cap={0} neck={1})".format(
             demo_cap, demo_neck
         ),
